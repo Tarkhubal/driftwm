@@ -413,8 +413,12 @@ impl InputMethodHandler for DriftWm {
 delegate_input_method_manager!(DriftWm);
 
 impl IdleInhibitHandler for DriftWm {
-    fn inhibit(&mut self, _surface: WlSurface) {}
-    fn uninhibit(&mut self, _surface: WlSurface) {}
+    fn inhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibiting_surfaces.insert(surface);
+    }
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibiting_surfaces.remove(&surface);
+    }
 }
 
 delegate_idle_inhibit!(DriftWm);

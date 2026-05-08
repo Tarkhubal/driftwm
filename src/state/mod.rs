@@ -330,6 +330,10 @@ pub struct DriftWm {
     pub security_context_state: SecurityContextState,
     #[allow(dead_code)]
     pub idle_inhibit_state: IdleInhibitManagerState,
+    /// Surfaces holding zwp-idle-inhibit-v1 inhibitors. Refreshed each frame:
+    /// only surfaces actively scanning out (visible) count, so a hidden
+    /// browser tab playing video doesn't keep the screen awake.
+    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub idle_notifier_state: IdleNotifierState<DriftWm>,
     #[allow(dead_code)]
     pub presentation_state: PresentationState,
@@ -482,6 +486,24 @@ pub(crate) fn client_is_unrestricted(
 }
 
 impl DriftWm {
+    /// Drop dead inhibitors and tell the idle-notifier whether any *visible*
+    /// inhibitor surface is currently scanning out. Hidden inhibitors (e.g.
+    /// a background browser tab playing video) don't count, otherwise the
+    /// screen would never lock.
+    pub fn refresh_idle_inhibit(&mut self) {
+        use smithay::desktop::utils::surface_primary_scanout_output;
+        use smithay::wayland::compositor::with_states;
+
+        self.idle_inhibiting_surfaces.retain(|s| s.is_alive());
+
+        let is_inhibited = self.idle_inhibiting_surfaces.iter().any(|surface| {
+            with_states(surface, |states| {
+                surface_primary_scanout_output(surface, states).is_some()
+            })
+        });
+        self.idle_notifier_state.set_is_inhibited(is_inhibited);
+    }
+
     /// Push any `below` windows to the bottom of the z-order.
     /// Called after every `raise_element()` to maintain stacking.
     pub fn enforce_below_windows(&mut self) {

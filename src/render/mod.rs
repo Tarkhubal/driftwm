@@ -1593,4 +1593,6 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
     state.space.refresh();
     state.popups.cleanup();
     layer_map_for_output(output).cleanup();
+
+    state.refresh_idle_inhibit();
 }

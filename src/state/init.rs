@@ -193,6 +193,7 @@ impl DriftWm {
             virtual_keyboard_state,
             security_context_state,
             idle_inhibit_state,
+            idle_inhibiting_surfaces: HashSet::new(),
             idle_notifier_state,
             presentation_state,
             decoration_state,
