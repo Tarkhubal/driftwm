@@ -107,7 +107,7 @@ impl DriftWm {
                                 let dy = c.y - center.y;
                                 dx * dx + dy * dy
                             };
-                            dist(a).partial_cmp(&dist(b)).unwrap()
+                            dist(a).total_cmp(&dist(b))
                         })
                         .cloned();
                     if let Some(window) = closest {

@@ -758,7 +758,7 @@ impl DriftWm {
                     None
                 }
             })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(o, _)| o)
     }
 

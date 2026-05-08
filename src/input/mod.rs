@@ -260,7 +260,7 @@ impl DriftWm {
             Some(o) => o,
             None => return,
         };
-        let output_geo = self.space.output_geometry(&output).unwrap();
+        let Some(output_geo) = self.space.output_geometry(&output) else { return };
 
         // position_transformed gives screen-local coords (0..width, 0..height)
         let screen_pos = event.position_transformed(output_geo.size);
