@@ -34,9 +34,8 @@ pub fn build_cursor_elements(
     let screen_pos = canvas_to_screen(CanvasPos(canvas_pos), camera, zoom).0;
     let physical_pos: Point<f64, Physical> = screen_pos.to_physical_precise_round(scale);
 
-    // Separate the status check from mutable state access (Rust 2024 borrow rules)
     let status = state.cursor.cursor_status.clone();
-    match status {
+    let mut result = match status {
         CursorImageStatus::Hidden => vec![],
         CursorImageStatus::Surface(ref surface) => {
             if !surface.alive() {
@@ -68,7 +67,29 @@ pub fn build_cursor_elements(
         CursorImageStatus::Named(icon) => {
             build_xcursor_elements(state, renderer, physical_pos, icon.name(), alpha)
         }
+    };
+
+    // Drag-and-drop icon
+    if let Some(ref icon) = state.dnd_icon {
+        if icon.alive() {
+            let pos: Point<i32, Physical> = (
+                physical_pos.x as i32,
+                physical_pos.y as i32,
+            ).into();
+            let surface_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                    renderer,
+                    icon,
+                    pos,
+                    Scale::from(1.0),
+                    alpha,
+                    Kind::Cursor,
+                );
+            result.extend(surface_elems.into_iter().map(|e| OutputRenderElements::CursorSurface(e.into())));
+        }
     }
+
+    result
 }
 
 /// Build xcursor memory buffer elements for a named cursor icon.
@@ -86,7 +107,6 @@ fn build_xcursor_elements(
     let key = if loaded { name } else { "default" };
     let cursor_frames = state.cursor.cursor_buffers.get(key).unwrap();
 
-    // Select the active frame
     let frame_idx = if cursor_frames.total_duration_ms == 0 {
         0
     } else {

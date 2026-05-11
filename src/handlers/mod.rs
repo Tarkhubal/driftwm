@@ -128,11 +128,12 @@ impl WaylandDndGrabHandler for DriftWm {
     fn dnd_requested<S: dnd::Source>(
         &mut self,
         source: S,
-        _icon: Option<WlSurface>,
+        icon: Option<WlSurface>,
         seat: Seat<Self>,
         serial: Serial,
         type_: dnd::GrabType,
     ) {
+        self.dnd_icon = icon;
         match type_ {
             dnd::GrabType::Pointer => {
                 let pointer = seat.get_pointer().unwrap();
@@ -149,7 +150,17 @@ impl WaylandDndGrabHandler for DriftWm {
         }
     }
 }
-impl dnd::DndGrabHandler for DriftWm {}
+impl dnd::DndGrabHandler for DriftWm {
+    fn dropped(
+        &mut self,
+        _target: Option<dnd::DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+}
 
 delegate_data_device!(DriftWm);
 
