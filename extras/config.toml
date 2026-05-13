@@ -144,6 +144,7 @@ size=[500, 725]
 [[window_rules]]
 app_id = "org.telegram.desktop"
 decoration = "server"
+blur = true
 
 # Blur shell-overlay popups (notifications + launcher)
 [[window_rules]]
