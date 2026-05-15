@@ -75,7 +75,7 @@ differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 | Field                  | Type                     | Default   | Description                                                                                                                                              |
 | ---------------------- | ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up)                                                                                                 |
-| `size`                 | `[w, h]`                 | —         | Force window dimensions in pixels                                                                                                                        |
+| `size`                 | `[w, h]`                 | —         | Initial window dimensions in pixels (one-shot: the user/app can resize freely afterwards; pair with `widget = true` to keep the size locked)             |
 | `widget`               | `bool`                   | `false`   | Pin window: immovable, below normal windows, excluded from navigation/alt-tab                                                                            |
 | `decoration`           | string                   | inherited | Override decoration mode (see below)                                                                                                                     |
 | `blur`                 | `bool`                   | `false`   | Blur compositor background behind this window                                                                                                            |
@@ -186,7 +186,7 @@ app_id    = "/^steam_app_\\d+$/"
 pass_keys = true
 ```
 
-### Force size and position for a floating panel
+### Initial size and position for a floating panel
 
 ```toml
 [[window_rules]]

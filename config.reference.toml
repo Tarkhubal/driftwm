@@ -410,7 +410,7 @@
 #
 # Effect fields:
 #   position   — [x, y] canvas coordinates to place the window (window center, Y-up)
-#   size       — [width, height] to force window dimensions
+#   size       — [width, height] initial window dimensions (one-shot; user/app can resize after)
 #   widget     — true: pinned (immovable), below normal windows, excluded from
 #                navigation and alt-tab (default: false)
 #   decoration — overrides [decorations] default_mode for matched windows.

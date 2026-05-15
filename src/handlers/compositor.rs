@@ -311,10 +311,16 @@ impl CompositorHandler for DriftWm {
                     };
 
                     let mut placed_at_cursor = false;
+                    // One-shot: when a rule forces an initial size, the first
+                    // commit reaches here with the client's preferred size,
+                    // not the rule's. We send a configure with the rule's
+                    // size and wait — positioning, decoration setup, and
+                    // navigation run on the follow-up commit (when the client
+                    // has re-rendered). `pending_size` is the gate so we
+                    // never re-force on subsequent commits, leaving the
+                    // window free to be resized by the user/app later.
+                    let mut force_pending = false;
 
-                    // Force size on first commit: send a configure with the
-                    // rule's size, re-insert into pending_center, and wait for
-                    // the client to re-render at the new dimensions.
                     if let Some(ref applied) = applied
                         && let Some((w, h)) = applied.size
                         && self.pending_size.insert(root.clone())
@@ -325,6 +331,7 @@ impl CompositorHandler for DriftWm {
                             });
                             toplevel.send_configure();
                             self.pending_center.insert(root.clone());
+                            force_pending = true;
                         } else {
                             self.pending_size.remove(&root);
                         }
@@ -462,7 +469,7 @@ impl CompositorHandler for DriftWm {
                         }
                     }
 
-                    if has_size {
+                    if has_size && !force_pending {
                         // Create the title bar widget BEFORE navigate_to_window so
                         // window_ssd_bar() returns the correct height. Otherwise
                         // the camera target centers the client body (ignoring the
@@ -510,7 +517,7 @@ impl CompositorHandler for DriftWm {
                         // One-shot: snapshot is only valid for the first
                         // placement; later commits use the now-mapped state.
                         self.auto_anchor_snapshot.remove(&root);
-                    } else {
+                    } else if !has_size {
                         // No size yet — retry next commit
                         self.pending_center.insert(root.clone());
                     }
