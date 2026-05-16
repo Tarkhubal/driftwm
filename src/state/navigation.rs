@@ -4,6 +4,7 @@ use smithay::{
     utils::Point,
     wayland::seat::WaylandFocus,
 };
+use crate::surface_tree::focus_belongs_to_window;
 use driftwm::window_ext::WindowExt;
 
 use super::DriftWm;
@@ -73,15 +74,19 @@ impl DriftWm {
     /// Should NOT be called during Alt-Tab cycling (history is frozen).
     /// Skips windows with `skip_taskbar` rule.
     pub fn update_focus_history(&mut self, surface: &WlSurface) {
-        if driftwm::config::applied_rule(surface).is_some_and(|r| r.widget) {
-            return;
-        }
         let window = self
             .space
             .elements()
-            .find(|w| w.wl_surface().as_deref() == Some(surface))
+            .find(|w| focus_belongs_to_window(surface, w))
             .cloned();
         if let Some(window) = window {
+            if window
+                .wl_surface()
+                .and_then(|s| driftwm::config::applied_rule(&s))
+                .is_some_and(|r| r.widget)
+            {
+                return;
+            }
             // Modal dialogs don't enter focus history — Alt-Tab navigates to
             // the parent instead, and focus redirect handles the rest.
             if window.is_modal() {

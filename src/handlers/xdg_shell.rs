@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 use crate::grabs::{MoveSurfaceGrab, ResizeState, ResizeSurfaceGrab};
 use crate::state::{DriftWm, FocusTarget, output_state};
+use crate::surface_tree::focus_belongs_to_toplevel;
 use driftwm::window_ext::WindowExt;
 use smithay::{
     delegate_xdg_shell,
@@ -209,28 +210,33 @@ impl XdgShellHandler for DriftWm {
             let parent_focus = window.parent_surface().and_then(|ps| {
                 let parent = self.window_for_surface(&ps)?;
                 // If parent has another modal child, focus that instead
-                let target = self.topmost_modal_child(&parent)
+                Some(self.topmost_modal_child(&parent)
                     .filter(|mc| mc != window)
-                    .unwrap_or(parent);
-                target.wl_surface().map(|s| FocusTarget(s.into_owned()))
+                    .unwrap_or(parent))
             });
 
             let keyboard = self.seat.get_keyboard().unwrap();
-            if keyboard
-                .current_focus()
-                .is_some_and(|f| f.0 == wl_surface)
-            {
-                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                // Standalone toplevels have no parent — fall back to the most
-                // recent previous window so focus does not vanish (important
-                // with focus_follows_mouse when the pointer is over empty canvas).
-                let fallback = parent_focus.or_else(|| {
-                    self.focus_history
-                        .iter()
-                        .find(|w| w != &window)
-                        .and_then(|w| w.wl_surface().map(|s| FocusTarget(s.into_owned())))
-                });
-                keyboard.set_focus(self, fallback, serial);
+            let current_focus = keyboard.current_focus();
+            let no_keyboard_focus = current_focus.is_none();
+            let focus_on_this_toplevel = current_focus
+                .as_ref()
+                .is_some_and(|f| focus_belongs_to_toplevel(&f.0, &wl_surface));
+            let was_last_focused = self
+                .focus_history
+                .first()
+                .is_some_and(|last_focused| last_focused == window);
+            if focus_on_this_toplevel || was_last_focused || no_keyboard_focus {
+                if let Some(parent_focus) = parent_focus {
+                    self.navigate_to_window(&parent_focus, false);
+                } else if let Some(fallback) = self
+                    .focus_history
+                    .iter()
+                    .find(|w| w != &window)
+                    .and_then(|w| w.wl_surface().map(|s| FocusTarget(s.into_owned())))
+                {
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    keyboard.set_focus(self, Some(fallback), serial);
+                }
             }
             // If the destroyed window was fullscreen, restore viewport
             let fs_output = self.fullscreen.iter()

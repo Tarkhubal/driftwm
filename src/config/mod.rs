@@ -66,7 +66,8 @@ pub struct Config {
     /// Padding (viewport/screen pixels) around the bounding box for ZoomToFit.
     /// Screen-space so the gutter is consistent regardless of the resulting zoom.
     pub zoom_fit_padding: f64,
-    /// Animate zoom back to 1.0 when a new window is mapped (true) or preserve current zoom (false).
+    /// Animate zoom back to 1.0 when a new window is mapped
+    /// (true) or preserve current zoom (false).
     pub zoom_reset_on_new_window: bool,
     /// Animate zoom back to 1.0 when an off-screen window requests activation
     /// (xdg-activation or foreign-toplevel click) (true) or just pan to it at current zoom (false).
