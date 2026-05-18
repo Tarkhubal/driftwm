@@ -64,6 +64,16 @@ impl CompositorHandler for DriftWm {
         self.render.border_cache.remove(&id);
         // lock_surfaces is keyed by output, not surface — sweep values.
         self.lock_surfaces.retain(|_, ls| ls.wl_surface() != surface);
+        // Crash path: wl_surface dies without toplevel_destroyed firing, so
+        // mirror its focus_history cleanup here.
+        self.focus_history.retain(|w| w.wl_surface().as_deref() != Some(surface));
+        if self.cycle_state.is_some() {
+            if self.focus_history.is_empty() {
+                self.cycle_state = None;
+            } else if let Some(ref mut idx) = self.cycle_state {
+                *idx = (*idx).min(self.focus_history.len() - 1);
+            }
+        }
     }
 
     fn new_surface(&mut self, surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface) {
