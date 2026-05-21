@@ -4,6 +4,10 @@
 //! A single render thread drives all decoration rendering, so the `FontSystem`
 //! and `SwashCache` live in `thread_local!` cells — no locking needed. The
 //! first access scans system fonts (one-time cost).
+//!
+//! With no fonts installed — a hermetic build sandbox, or a minimal system —
+//! every function here degrades to empty output instead of panicking, so the
+//! SSD simply renders a textless title bar.
 
 use std::cell::RefCell;
 
@@ -20,6 +24,14 @@ thread_local! {
 
 /// Ellipsis appended to truncated titles.
 const ELLIPSIS: char = '…';
+
+/// Whether the font database holds at least one font. Empty in hermetic build
+/// sandboxes and on systems with no fonts installed; shaping anything in that
+/// state panics ("no default font found") deep inside cosmic-text, so the
+/// public functions below short-circuit instead.
+fn fonts_available() -> bool {
+    FONT_SYSTEM.with_borrow(|fs| fs.db().faces().next().is_some())
+}
 
 fn weight_of(weight: FontWeight) -> Weight {
     match weight {
@@ -51,7 +63,7 @@ fn shape_line(fs: &mut FontSystem, text: &str, font: &str, size: f32, weight: Fo
 
 /// Pixel width of `text` shaped at `size`. `0` for empty text.
 pub fn measure(text: &str, font: &str, size: f32, weight: FontWeight) -> i32 {
-    if text.is_empty() {
+    if text.is_empty() || !fonts_available() {
         return 0;
     }
     FONT_SYSTEM.with_borrow_mut(|fs| {
@@ -73,6 +85,9 @@ pub fn fit_text(
     weight: FontWeight,
     max_width: i32,
 ) -> (String, i32) {
+    if !fonts_available() {
+        return (String::new(), 0);
+    }
     let full = measure(text, font, size, weight);
     if full <= max_width {
         return (text.to_string(), full);
@@ -115,7 +130,7 @@ pub fn rasterize_into(
     color: [u8; 4],
     origin_x: i32,
 ) {
-    if text.is_empty() {
+    if text.is_empty() || !fonts_available() {
         return;
     }
     let base = Color::rgba(color[0], color[1], color[2], color[3]);
@@ -170,6 +185,11 @@ mod tests {
 
     #[test]
     fn measure_nonempty_is_positive() {
+        // Skipped where no fonts exist (hermetic build sandboxes): there is
+        // nothing to shape against, and the functions degrade to empty output.
+        if !fonts_available() {
+            return;
+        }
         assert!(measure("Hello", FONT, 13.0, FontWeight::Normal) > 0);
     }
 
@@ -180,6 +200,9 @@ mod tests {
 
     #[test]
     fn fit_text_returns_full_when_it_fits() {
+        if !fonts_available() {
+            return;
+        }
         let (s, w) = fit_text("Hi", FONT, 13.0, FontWeight::Normal, 100_000);
         assert_eq!(s, "Hi");
         assert!(w > 0);
@@ -187,6 +210,9 @@ mod tests {
 
     #[test]
     fn fit_text_ellipsizes_when_too_wide() {
+        if !fonts_available() {
+            return;
+        }
         let long = "A very long window title that will never fit in here";
         let full = measure(long, FONT, 13.0, FontWeight::Normal);
         let max = full / 2;
@@ -198,6 +224,9 @@ mod tests {
 
     #[test]
     fn fit_text_empty_when_ellipsis_does_not_fit() {
+        if !fonts_available() {
+            return;
+        }
         let (s, w) = fit_text("Title", FONT, 13.0, FontWeight::Normal, 1);
         assert_eq!(s, "");
         assert_eq!(w, 0);
