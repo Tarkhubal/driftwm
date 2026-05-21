@@ -1,7 +1,12 @@
 # driftwm — personal config (symlink to ~/.config/driftwm/config.toml)
 
 autostart = [
-    "eval $(gnome-keyring-daemon --start --components=secrets,ssh) && systemctl --user import-environment SSH_AUTH_SOCK GNOME_KEYRING_CONTROL && dbus-update-activation-environment SSH_AUTH_SOCK GNOME_KEYRING_CONTROL",
+    # gnome-keyring is started+unlocked by PAM (pam_gnome_keyring auto_start in
+    # /etc/pam.d/gdm-password and gdm-autologin) with the secrets component only;
+    # driftwm-session imports the PAM env into systemd/D-Bus before driftwm
+    # launches. This line attaches the ssh component to the already-unlocked
+    # daemon and propagates SSH_AUTH_SOCK (PAM doesn't set it for ssh-only).
+    "eval $(gnome-keyring-daemon --start --components=ssh) && systemctl --user import-environment SSH_AUTH_SOCK && dbus-update-activation-environment SSH_AUTH_SOCK",
     "/usr/libexec/polkit-gnome-authentication-agent-1",
     "swayosd-server --top-margin 0.95",
     "swaync",
@@ -12,6 +17,7 @@ autostart = [
      "~/Documents/work/scripts/driftwm/extras/scripts/battery_notify.sh",
      "~/Documents/work/scripts/driftwm/extras/scripts/theme-watch.sh",
      "swayidle -w timeout 300 'brightnessctl -s set 10%' resume 'brightnessctl -r' timeout 330 '~/Documents/work/scripts/driftwm/extras/scripts/lock.sh' timeout 600 'systemctl suspend' before-sleep '~/Documents/work/scripts/driftwm/extras/scripts/lock.sh'",
+     "sway-audio-idle-inhibit",
 ]
 
 focus_follows_mouse = true
@@ -20,9 +26,13 @@ window_placement = "auto"
 [env]
 QT_QPA_PLATFORMTHEME = "qt6ct"
 
+[snap]
+same_edge = true
+edge_center = true
+
 [input.keyboard]
 layout = "us,ru"
-options = "grp:win_space_toggle"
+options = "grp:caps_toggle,grp_led:caps,altwin:ctrl_alt_win"
 
 [zoom]
 reset_on_new_window = false
