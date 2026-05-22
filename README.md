@@ -177,7 +177,7 @@ window-search script that lets you search and jump to any open window.
 - New window placement: in viewport center (default), under cursor, or snapped adjacent to the focused window's cluster
 - Click-to-focus (default) or focus-follows-mouse (sloppy focus)
 - Session lock (swaylock), idle notify (swayidle/hypridle)
-- Screen capture: screencasting (OBS, Firefox, Discord — requires `xdg-desktop-portal` + `xdg-desktop-portal-wlr` or `xdg-desktop-portal-cosmic`) and screenshots (grim + slurp)
+- Screen capture: screencasting (OBS, Firefox, Discord) and screenshots
 - 40+ Wayland protocols
 
 ## Install
@@ -250,11 +250,6 @@ sudo pacman -S libdisplay-info libinput seatd mesa libxkbcommon
 > **Note:** Ubuntu 24.04 ships Rust 1.75 which is too old. Install via
 > [rustup](https://rustup.rs/) instead of `apt install rustc`.
 
-> **Optional:** SSD title bars render the window title in `Adwaita Sans` by
-> default (to match GTK apps). Install `adwaita-fonts` (Arch/Fedora) for the
-> intended look — without it a generic sans-serif is substituted. The font,
-> size, weight, and alignment are configurable under `[decorations]`.
-
 Then build and install:
 
 ```bash
@@ -266,12 +261,20 @@ sudo make install
 
 To uninstall, run `sudo make uninstall` from the repository.
 
-### X11 support
+### Optional runtime dependencies
 
-X11 apps run through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
-(>= 0.7). driftwm spawns it at startup and exports `DISPLAY=:N` so X11 clients
-connect transparently. No extra config needed beyond having the binary in
-`$PATH`.
+driftwm runs standalone — none of these are required — but each enables or
+improves a feature:
+
+- `xwayland-satellite` (>= 0.7) — X11 app support (see below).
+- `xdg-desktop-portal` + `xdg-desktop-portal-wlr` (or `xdg-desktop-portal-cosmic`) — screencasting.
+- `grim` + `slurp` — screenshots (+ cropping to region).
+- `adwaita-fonts` — renders SSD title bars in `Adwaita Sans` to match GTK apps; without it a generic sans-serif is substituted. Font, size, weight, and alignment are configurable under `[decorations]`.
+- A cursor theme — most desktops set one up already; on a bare install driftwm falls back to a basic built-in arrow.
+
+**X11 apps** run through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite),
+which driftwm spawns at startup, exporting `DISPLAY=:N` so X11 clients connect
+transparently — no extra config beyond having the binary in `$PATH`.
 
 - **Arch:** `sudo pacman -S xwayland-satellite`
 - **Fedora:** `sudo dnf install xwayland-satellite`
@@ -282,13 +285,13 @@ If satellite isn't found at startup, driftwm logs a warning and continues withou
 X11 support. You can override the binary path or disable the integration in
 [`config.reference.toml`](config.reference.toml) under `[xwayland]`.
 
-> Logs go to `$XDG_RUNTIME_DIR/driftwm.log` when launched by a display manager, otherwise stderr.
-
 ### Running
 
 driftwm auto-detects whether it's running nested (inside an existing Wayland
 session) or on real hardware (from a TTY). Just run `driftwm`. For display
 manager integration, select "driftwm" from the session menu.
+
+> Logs go to `$XDG_RUNTIME_DIR/driftwm.log` when launched by a display manager, otherwise stderr.
 
 ## Quick start
 
