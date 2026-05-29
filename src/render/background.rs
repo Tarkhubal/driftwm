@@ -80,18 +80,45 @@ pub fn init_background(
     // shader and skips re-derivation, so a reset would freeze animated /
     // stall pan-driven shaders on the new output. Each init branch is
     // responsible for setting the flags on its own success path.
-    let texture_init: Option<bool> = match state.config.background.kind.clone() {
-        BackgroundKind::Tile(path) => Some(try_init_texture_bg(
+    // `None` means this output reused a cached compiled shader and reached no
+    // fresh verdict, so the error set by the output that first compiled it must
+    // be left untouched (a second-monitor cache hit must not clear it).
+    let outcome: Option<Result<(), String>> = match state.config.background.kind.clone() {
+        BackgroundKind::Tile(path) => texture_or_shader_fallback(
             state, renderer, initial_size, output_name, &path, TextureBgMode::Tile,
-        )),
-        BackgroundKind::Wallpaper(path) => Some(try_init_texture_bg(
+        ),
+        BackgroundKind::Wallpaper(path) => texture_or_shader_fallback(
             state, renderer, initial_size, output_name, &path, TextureBgMode::Wallpaper,
-        )),
-        BackgroundKind::Shader(_) | BackgroundKind::Default => None,
+        ),
+        BackgroundKind::Shader(_) | BackgroundKind::Default => {
+            init_shader_bg(state, renderer, initial_size, output_name)
+        }
     };
 
-    if texture_init != Some(true) {
-        init_shader_bg(state, renderer, initial_size, output_name);
+    match outcome {
+        Some(Ok(())) => state.clear_error(crate::state::ErrorSource::Background),
+        Some(Err(msg)) => state.set_error(crate::state::ErrorSource::Background, msg),
+        None => {}
+    }
+}
+
+/// Try the configured image; on failure fall back to the default shader but
+/// report the image error (the image is what the user asked for). Always
+/// returns a verdict (the image is loaded fresh per call, never cached).
+fn texture_or_shader_fallback(
+    state: &mut crate::state::DriftWm,
+    renderer: &mut GlesRenderer,
+    initial_size: Size<i32, Logical>,
+    output_name: &str,
+    path: &str,
+    mode: TextureBgMode,
+) -> Option<Result<(), String>> {
+    match try_init_texture_bg(state, renderer, initial_size, output_name, path, mode) {
+        Ok(()) => Some(Ok(())),
+        Err(msg) => {
+            init_shader_bg(state, renderer, initial_size, output_name);
+            Some(Err(msg))
+        }
     }
 }
 
@@ -101,7 +128,8 @@ enum TextureBgMode {
     Wallpaper,
 }
 
-/// Returns true on success. On failure, the caller falls back to shader mode.
+/// `Ok` on success. On failure the caller falls back to shader mode; the error
+/// string is surfaced on the error bar.
 fn try_init_texture_bg(
     state: &mut crate::state::DriftWm,
     renderer: &mut GlesRenderer,
@@ -109,10 +137,8 @@ fn try_init_texture_bg(
     output_name: &str,
     path: &str,
     mode: TextureBgMode,
-) -> bool {
-    let Some((texture, w, h)) = load_image_to_texture(renderer, path) else {
-        return false;
-    };
+) -> Result<(), String> {
+    let (texture, w, h) = load_image_to_texture(renderer, path)?;
 
     let shader_slot = match mode {
         TextureBgMode::Tile => &mut state.render.tile_shader,
@@ -125,11 +151,12 @@ fn try_init_texture_bg(
         };
     }
     let Some(shader) = shader_slot.clone() else {
-        tracing::error!("{:?} shader compilation failed, using default shader", match mode {
-            TextureBgMode::Tile => "Tile",
-            TextureBgMode::Wallpaper => "Wallpaper",
-        });
-        return false;
+        let kind = match mode {
+            TextureBgMode::Tile => "tile",
+            TextureBgMode::Wallpaper => "wallpaper",
+        };
+        tracing::error!("{kind} shader compilation failed, using default shader");
+        return Err(format!("background: {kind} shader failed to compile"));
     };
 
     let area = Rectangle::from_size(initial_size);
@@ -164,13 +191,13 @@ fn try_init_texture_bg(
     state.render.background_is_animated = false;
     state.render.background_uses_camera = false;
     state.render.background_uses_zoom = false;
-    true
+    Ok(())
 }
 
 fn load_image_to_texture(
     renderer: &mut GlesRenderer,
     path: &str,
-) -> Option<(GlesTexture, i32, i32)> {
+) -> Result<(GlesTexture, i32, i32), String> {
     use smithay::backend::renderer::ImportMem;
     use smithay::utils::Buffer;
 
@@ -178,7 +205,7 @@ fn load_image_to_texture(
         Ok(img) => img.into_rgba8(),
         Err(e) => {
             tracing::error!("Failed to load image {path}: {e}, using default shader");
-            return None;
+            return Err(format!("background image '{path}': {e}"));
         }
     };
     let (w, h) = img.dimensions();
@@ -189,30 +216,36 @@ fn load_image_to_texture(
         Size::<i32, Buffer>::from((w as i32, h as i32)),
         false,
     ) {
-        Ok(texture) => Some((texture, w as i32, h as i32)),
+        Ok(texture) => Ok((texture, w as i32, h as i32)),
         Err(e) => {
             tracing::error!("Failed to upload texture from {path}: {e}, using default shader");
-            None
+            Err(format!("background image '{path}': upload failed: {e}"))
         }
     }
 }
 
+/// `None` on a cache hit (no fresh verdict — the prior compile's error state
+/// stands); otherwise `Ok`/`Err` for a user shader that read+compiled or
+/// failed. The built-in default shader always yields `Ok`.
 fn init_shader_bg(
     state: &mut crate::state::DriftWm,
     renderer: &mut GlesRenderer,
     initial_size: Size<i32, Logical>,
     output_name: &str,
-) {
+) -> Option<Result<(), String>> {
     // Reuse cached shader if already compiled (avoids redundant GPU work
     // when multiple outputs each need a background element).
+    let mut outcome: Option<Result<(), String>> = None;
     let shader = if let Some(ref cached) = state.render.background_shader {
         cached.clone()
     } else {
+        let mut err: Option<String> = None;
         let shader_source = match &state.config.background.kind {
             BackgroundKind::Shader(path) => match std::fs::read_to_string(path) {
                 Ok(src) => src,
                 Err(e) => {
                     tracing::error!("Failed to read shader {path}: {e}, using default");
+                    err = Some(format!("background shader '{path}': {e}"));
                     driftwm::config::DEFAULT_SHADER.to_string()
                 }
             },
@@ -223,6 +256,7 @@ fn init_shader_bg(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to compile shader: {e}, using default");
+                err.get_or_insert_with(|| format!("background shader: compile error: {e}"));
                 renderer
                     .compile_custom_pixel_shader(driftwm::config::DEFAULT_SHADER, BG_UNIFORMS)
                     .expect("Default shader must compile")
@@ -233,6 +267,7 @@ fn init_shader_bg(
         state.render.background_uses_camera = references_uniform(&shader_source, "vec2", "u_camera");
         state.render.background_uses_zoom = references_uniform(&shader_source, "float", "u_zoom");
         state.render.background_shader = Some(compiled.clone());
+        outcome = Some(err.map_or(Ok(()), Err));
         compiled
     };
 
@@ -250,6 +285,8 @@ fn init_shader_bg(
         ],
         Kind::Unspecified,
     ));
+
+    outcome
 }
 
 /// True if `src` declares `uniform <type> <name>` (with optional precision

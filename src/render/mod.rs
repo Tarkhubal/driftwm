@@ -3,6 +3,7 @@ mod blur;
 mod capture;
 mod cursor;
 mod elements;
+mod error_bar;
 mod layers;
 mod lifecycle;
 mod shaders;
@@ -15,6 +16,7 @@ pub use cursor::build_cursor_elements;
 pub use elements::{
     OutputRenderElements, PixelSnapRescaleElement, RoundedCornerElement, TileShaderElement,
 };
+pub use error_bar::ErrorBarCache;
 pub use lifecycle::{
     post_render, refresh_foreign_toplevels, take_presentation_feedback,
     update_primary_scanout_output,
@@ -680,6 +682,7 @@ pub fn compose_frame(
             + bg_elements.len()
             + background_layer_elements.len(),
     );
+    let cursor_count = cursor_elements.len();
     all_elements.extend(cursor_elements);
     all_elements.extend(overlay_elements);
     all_elements.extend(top_elements);
@@ -703,6 +706,14 @@ pub fn compose_frame(
         let active_ids: std::collections::HashSet<_> =
             all_blur_requests.iter().map(|r| r.surface_id.clone()).collect();
         state.render.blur_cache.retain(|id, _| active_ids.contains(id));
+    }
+
+    // Error bar sits above every window and layer-shell surface but below the
+    // cursor. Spliced after blur so it doesn't shift the prefix offsets blur
+    // indexes into.
+    let error_bar = error_bar::build_error_bar_elements(state, renderer, output);
+    if !error_bar.is_empty() {
+        all_elements.splice(cursor_count..cursor_count, error_bar);
     }
 
     all_elements

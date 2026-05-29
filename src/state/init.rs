@@ -45,7 +45,7 @@ use smithay::{
         xdg_foreign::XdgForeignState,
     },
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use driftwm::config::Config;
@@ -295,6 +295,7 @@ impl DriftWm {
             satellite: None,
             udev_device: None,
             last_titlebar_click: None,
+            errors: BTreeMap::new(),
         }
     }
 }

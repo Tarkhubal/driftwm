@@ -39,6 +39,7 @@ pub struct RenderCache {
     pub cached_tile_bg: HashMap<String, crate::render::TileShaderElement>,
     pub wallpaper_shader: Option<GlesTexProgram>,
     pub cached_wallpaper_bg: HashMap<String, crate::render::TileShaderElement>,
+    pub cached_error_bar: HashMap<String, crate::render::ErrorBarCache>,
 }
 
 impl RenderCache {
@@ -66,6 +67,7 @@ impl RenderCache {
             cached_tile_bg: HashMap::new(),
             wallpaper_shader: None,
             cached_wallpaper_bg: HashMap::new(),
+            cached_error_bar: HashMap::new(),
         }
     }
 
@@ -81,6 +83,7 @@ impl RenderCache {
         self.cached_bg_elements.remove(output_name);
         self.cached_tile_bg.remove(output_name);
         self.cached_wallpaper_bg.remove(output_name);
+        self.cached_error_bar.remove(output_name);
         self.remove_capture_state(output_name);
     }
 }

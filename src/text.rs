@@ -33,6 +33,21 @@ fn fonts_available() -> bool {
     FONT_SYSTEM.with_borrow(|fs| fs.db().faces().next().is_some())
 }
 
+/// Map the generic CSS family names to cosmic-text's generic `Family` variants
+/// (which resolve via fontconfig aliases); any other string is a concrete face
+/// name. `Family::Name("monospace")` would NOT resolve — it looks for a face
+/// literally named "monospace" and silently falls back to the default font.
+fn family_of(name: &str) -> Family<'_> {
+    match name {
+        "monospace" => Family::Monospace,
+        "sans-serif" => Family::SansSerif,
+        "serif" => Family::Serif,
+        "cursive" => Family::Cursive,
+        "fantasy" => Family::Fantasy,
+        _ => Family::Name(name),
+    }
+}
+
 fn weight_of(weight: FontWeight) -> Weight {
     match weight {
         FontWeight::Thin => Weight::THIN,
@@ -54,7 +69,7 @@ fn shape_line(fs: &mut FontSystem, text: &str, font: &str, size: f32, weight: Fo
     // No width constraint → never wraps; generous height fits the single line.
     buffer.set_size(fs, None, Some(size * 4.0));
     let attrs = Attrs::new()
-        .family(Family::Name(font))
+        .family(family_of(font))
         .weight(weight_of(weight));
     buffer.set_text(fs, text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(fs, false);

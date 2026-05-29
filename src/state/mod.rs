@@ -1,6 +1,7 @@
 mod animation;
 mod cluster_snapshot;
 mod cursor;
+mod errors;
 pub mod fit;
 mod focus;
 mod fullscreen;
@@ -12,6 +13,7 @@ mod render_cache;
 pub use cluster_snapshot::ClusterResizeSnapshot;
 pub(crate) use cluster_snapshot::snap_targets_impl;
 pub use cursor::{CursorFrames, CursorState};
+pub use errors::ErrorSource;
 pub use focus::FocusTarget;
 pub use persistence::{read_all_per_output_state, remove_state_file};
 pub use render_cache::{BorderCacheEntry, RenderCache, ShadowCacheEntry};
@@ -38,7 +40,7 @@ use smithay::{
         shm::ShmState,
     },
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -507,6 +509,10 @@ pub struct DriftWm {
         Instant,
         smithay::reexports::wayland_server::backend::ObjectId,
     )>,
+
+    /// Compositor-generated errors shown in the on-screen error bar, keyed by
+    /// source. Empty = no bar. Use [`Self::set_error`]/[`Self::clear_error`].
+    pub errors: BTreeMap<ErrorSource, String>,
 }
 
 #[derive(Default)]

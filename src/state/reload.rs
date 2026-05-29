@@ -3,7 +3,7 @@
 
 use smithay::input::keyboard::XkbConfig;
 
-use super::{DriftWm, output_state};
+use super::{DriftWm, ErrorSource, output_state};
 
 impl DriftWm {
     pub fn reload_config(&mut self) {
@@ -15,6 +15,10 @@ impl DriftWm {
                     "Config reload: failed to read {}: {e}",
                     config_path.display()
                 );
+                self.set_error(
+                    ErrorSource::Config,
+                    format!("config: failed to read {}: {e}", config_path.display()),
+                );
                 return;
             }
         };
@@ -22,6 +26,7 @@ impl DriftWm {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Config reload: parse error: {e}");
+                self.set_error(ErrorSource::Config, format!("config error: {e}"));
                 return;
             }
         };
@@ -153,6 +158,7 @@ impl DriftWm {
         self.apply_output_rules_after_reload();
         self.recompute_decoration_scale();
 
+        self.clear_error(ErrorSource::Config);
         self.mark_all_dirty();
         tracing::info!("Config reloaded");
     }
