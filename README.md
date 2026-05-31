@@ -105,7 +105,7 @@ not stuck to the screen. This gives spatial awareness when panning.
 Three modes (all rendered as shaders internally):
 
 - **`shader`** — procedural GLSL, animated or static. Default is a dot grid. See [docs/shaders.md](docs/shaders.md) to write your own. Bundled shaders live in `extras/wallpapers/{static,animated}/`.
-- **`tile`** — any PNG/JPG, tiled infinitely across the canvas.
+- **`tile`** — PNG/JPG (single texture, tiled infinitely), or a tiled pyramidal TIFF for [gigapixel wallpapers](docs/gigapixel-wallpapers.md).
 - **`wallpaper`** — single image stretched to fill viewport (does not scroll/zoom) — a classic desktop wallpaper.
 
 GPU cost scales with what a shader reads: one that reads no viewport uniforms renders once (as cheap as `wallpaper`); reading `u_camera`/`u_zoom` redraws on pan/zoom; reading `u_time` redraws every frame. Tiles redraw on pan/zoom; `wallpaper` renders once.
@@ -115,6 +115,7 @@ GPU cost scales with what a shader reads: one that reads no viewport uniforms re
 type = "shader"
 path = "~/.config/driftwm/bg.glsl"
 # Or: type = "tile",      path = "~/Pictures/tile.png"
+# Or: type = "tile",      path = "~/Pictures/world.tif"   # pyramidal TIFF
 # Or: type = "wallpaper", path = "~/Pictures/wallpaper.jpg"
 ```
 

@@ -151,11 +151,17 @@ impl UdevDevice {
 /// with mutations on `data`.
 pub(crate) fn render_if_needed(data: &mut DriftWm) {
     // Fast path: nothing needs attention — skip all work when idle
+    let any_chunked_pending = data
+        .render
+        .cached_tile_chunks
+        .values()
+        .any(|c| c.has_pending_loads());
     if data.redraws_needed.is_empty()
         && !data.has_active_animations()
         && !data.render.background_is_animated
         && !data.output_config_dirty
         && data.pending_dpms.is_empty()
+        && !any_chunked_pending
     {
         return;
     }
@@ -212,6 +218,15 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
             continue;
         }
         if data.output_has_active_animations(&surface.output) {
+            data.redraws_needed.insert(surface.output.clone());
+        }
+        // Chunked-bg with tiles still to upload: keep firing frames until the
+        // visible set fully resolves. Otherwise the loop idles after pan
+        // stops and blurry chunks stay covered by the fallback plane until
+        // unrelated damage (cursor, animation, client commit) wakes us.
+        if let Some(cache) = data.render.cached_tile_chunks.get(&surface.output.name())
+            && cache.has_pending_loads()
+        {
             data.redraws_needed.insert(surface.output.clone());
         }
     }
@@ -1317,6 +1332,9 @@ fn render_frame(
     output: &Output,
     crtc: crtc::Handle,
 ) {
+    #[cfg(feature = "profile-with-tracy")]
+    let _span = tracy_client::span!("udev::render_frame");
+
     data.redraws_needed.remove(output);
 
     // Flush Wayland clients
@@ -1483,6 +1501,12 @@ fn render_frame(
     // Post-render
     crate::render::post_render(data, output);
     data.display_handle.flush_clients().ok();
+
+    #[cfg(feature = "profile-with-tracy")]
+    {
+        drop(_span);
+        tracy_client::Client::running().map(|c| c.frame_mark());
+    }
 }
 
 /// Forward a page-flip's timing to all clients waiting on `wp_presentation`.

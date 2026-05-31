@@ -7,6 +7,9 @@ mod error_bar;
 mod layers;
 mod lifecycle;
 mod shaders;
+mod tile_chunks;
+mod tile_chunks_tiff;
+mod tile_worker;
 
 pub use background::{init_background, update_background_element};
 pub use blur::BlurCache;
@@ -17,6 +20,7 @@ pub use elements::{
     OutputRenderElements, PixelSnapRescaleElement, RoundedCornerElement, TileShaderElement,
 };
 pub use error_bar::ErrorBarCache;
+pub use tile_chunks::BgChunkCache;
 pub use lifecycle::{
     post_render, refresh_foreign_toplevels, take_presentation_feedback,
     update_primary_scanout_output,
@@ -150,6 +154,9 @@ pub fn compose_frame(
     output: &Output,
     cursor_elements: Vec<OutputRenderElements>,
 ) -> Vec<OutputRenderElements> {
+    #[cfg(feature = "profile-with-tracy")]
+    let _span = tracy_client::span!("compose_frame");
+
     if state.dnd_icon.as_ref().is_some_and(|i| !i.surface.alive()) {
         state.dnd_icon = None;
     }
@@ -162,6 +169,7 @@ pub fn compose_frame(
     if !state.render.cached_bg_elements.contains_key(&name)
         && !state.render.cached_tile_bg.contains_key(&name)
         && !state.render.cached_wallpaper_bg.contains_key(&name)
+        && !state.render.cached_tile_chunks.contains_key(&name)
     {
         let output_size = crate::state::output_logical_size(output);
         init_background(state, renderer, output_size, &name);
@@ -616,7 +624,18 @@ pub fn compose_frame(
     );
 
     let bg_elements: Vec<OutputRenderElements> =
-        if let Some(elem) = state.render.cached_bg_elements.get(&output.name()) {
+        if let Some(cache) = state.render.cached_tile_chunks.get_mut(&output.name()) {
+            // 8 GLES uploads/frame: decode is off-thread, so render-time per
+            // blob is the only constraint. import_memory of a 256×256 RGBA8 is
+            // sub-ms on M1, ~2-3ms on weak iGPUs — 8 keeps upload under ~25ms on
+            // the slow path and drains a worker burst in one frame on fast
+            // hardware. Coarser-LOD overlays + fallback plane cover undrained.
+            cache.ensure_visible_loaded(visible_rect, renderer, zoom, 8);
+            tile_chunks::chunk_render_elements(cache, visible_rect, camera, zoom)
+                .into_iter()
+                .map(OutputRenderElements::TileBgChunk)
+                .collect()
+        } else if let Some(elem) = state.render.cached_bg_elements.get(&output.name()) {
             vec![OutputRenderElements::Background(
                 RescaleRenderElement::from_element(
                     elem.clone(),
