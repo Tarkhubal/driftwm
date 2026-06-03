@@ -33,6 +33,11 @@
 # Commands to run at startup (after WAYLAND_DISPLAY is set).
 # Each entry is passed to sh -c, so full shell syntax works (pipes, &&, env vars).
 # autostart = []
+#
+# Running driftwm as a systemd session (via driftwm-session / a display manager)
+# also launches XDG autostart entries (~/.config/autostart, /etc/xdg/autostart),
+# in addition to the autostart list above. To opt out:
+#   systemctl --user mask xdg-desktop-autostart.target
 
 # Environment variables set before any clients launch.
 # Child processes (autostart, exec bindings) inherit these.
