@@ -17,7 +17,7 @@ Designed with laptops in mind: navigation and window management are trackpad-fir
 
 Built on [smithay](https://github.com/Smithay/smithay). Inspired by [vxwm](https://codeberg.org/wh1tepearl/vxwm); borrows implementation details from [niri](https://github.com/YaLTeR/niri).
 
-> [!WARNING]  
+> [!WARNING]
 > This is experimental software. Primarily built with AI. Use at your own risk.
 
 ## Features
@@ -153,8 +153,8 @@ decoration = "none"
 ```
 
 > [!TIP]
-> To find a window's `app_id`, check `$XDG_RUNTIME_DIR/driftwm/state` —
-> the `windows` field lists all open windows by their app ID.
+> To find a window's `app_id` or `title`, run `driftwm msg state` — it lists
+> every open window with its app ID, title, position, and size.
 
 See [docs/window-rules.md](docs/window-rules.md) for more details.
 
@@ -186,6 +186,7 @@ window-search script that lets you search and jump to any open window.
 - Session lock (swaylock), idle notify (swayidle/hypridle)
 - Screen capture: screencasting (OBS, Firefox, Discord) and screenshots
 - 40+ Wayland protocols
+- [IPC control](docs/ipc.md): script the compositor over a Unix socket with `driftwm msg`
 
 ## Install
 
@@ -298,7 +299,6 @@ X11 support. You can override the binary path or disable the integration in
 driftwm auto-detects whether it's running nested (inside an existing Wayland
 session) or on real hardware (from a TTY). Just run `driftwm`. For display
 manager integration, select "driftwm" from the session menu.
-
 
 > [!TIP]
 > When launched by a display manager, driftwm runs as a systemd user service — view logs with `journalctl --user -u driftwm.service` (add `-f` to follow). Run directly and logs go to stderr.

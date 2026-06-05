@@ -50,6 +50,36 @@ pub fn rule_to_internal(x: i32, y: i32, size: Size<i32, Logical>) -> Point<i32, 
     Point::from((x - size.w / 2, -y - size.h / 2))
 }
 
+/// The viewport center in canvas coords, in the user-facing convention (Y-up).
+/// Shared by the state file and IPC so they can't drift. Inverse of
+/// [`camera_for_center`].
+#[inline]
+pub fn viewport_center(
+    camera: Point<f64, Logical>,
+    zoom: f64,
+    viewport: Size<i32, Logical>,
+) -> (f64, f64) {
+    (
+        camera.x + viewport.w as f64 / (2.0 * zoom),
+        -(camera.y + viewport.h as f64 / (2.0 * zoom)),
+    )
+}
+
+/// The camera (internal top-left, Y-down) that centers the viewport on the Y-up
+/// point `(x, y)`. Inverse of [`viewport_center`].
+#[inline]
+pub fn camera_for_center(
+    x: f64,
+    y: f64,
+    zoom: f64,
+    viewport: Size<i32, Logical>,
+) -> Point<f64, Logical> {
+    Point::from((
+        x - viewport.w as f64 / (2.0 * zoom),
+        -y - viewport.h as f64 / (2.0 * zoom),
+    ))
+}
+
 /// Compute the camera position that centers a window at `screen_center` on screen.
 /// `screen_center` is the screen-space point where the window center should appear
 /// (typically the usable area center, accounting for panel exclusive zones).
@@ -416,6 +446,28 @@ mod tests {
     #[test]
     fn rule_coords_center_y_up() {
         assert_eq!(internal_to_rule((0, 0).into(), vp(100, 100)), (50, -50));
+    }
+
+    #[test]
+    fn viewport_center_round_trip() {
+        let viewport = vp(1920, 1080);
+        for (camera, zoom) in [
+            (cam(0.0, 0.0), 1.0),
+            (cam(-960.0, -540.0), 1.0),
+            (cam(123.0, -45.0), 0.5),
+            (cam(-200.0, 300.0), 2.0),
+        ] {
+            let (x, y) = viewport_center(camera, zoom, viewport);
+            let back = camera_for_center(x, y, zoom, viewport);
+            assert!((back.x - camera.x).abs() < 1e-9 && (back.y - camera.y).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn camera_for_center_centers_origin() {
+        let viewport = vp(1000, 800);
+        let camera = camera_for_center(0.0, 0.0, 1.0, viewport);
+        assert_eq!(viewport_center(camera, 1.0, viewport), (0.0, 0.0));
     }
 
     #[test]

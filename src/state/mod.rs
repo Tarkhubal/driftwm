@@ -464,7 +464,7 @@ pub struct DriftWm {
     /// Active XKB layout name (e.g. "English (US)"), updated on key events.
     pub active_layout: String,
     pub state_file_layout: String,
-    pub state_file_windows: Vec<persistence::WindowFingerprint>,
+    pub state_file_windows: Vec<crate::ipc::protocol::WindowInfo>,
     pub state_file_layer_count: usize,
 
     pub autostart: Vec<String>,

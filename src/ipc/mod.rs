@@ -1,14 +1,27 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
-use smithay::utils::{Point, SERIAL_COUNTER};
+use smithay::utils::SERIAL_COUNTER;
 
-use crate::state::{DriftWm, output_state};
+use crate::state::DriftWm;
 use driftwm::window_ext::WindowExt;
+
+pub mod client;
+pub mod protocol;
+
+use self::protocol::{Reply, Request, Response, socket_path};
+
+/// Reject a command line longer than this (without a newline) — bounds the
+/// per-connection buffer against a client that never terminates a command.
+const MAX_COMMAND_SIZE: usize = 4096;
+
+/// Cap how long a reply write may block, so a stuck reader can't hang the loop.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct IpcServer {
     socket_path: PathBuf,
@@ -17,36 +30,36 @@ pub struct IpcServer {
 impl IpcServer {
     pub fn new(
         event_loop: &LoopHandle<'static, DriftWm>,
+        wayland_display: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        let socket_path = PathBuf::from(format!("{}/driftwm/ipc.sock", runtime_dir));
+        let socket_path = socket_path(wayland_display);
 
         std::fs::remove_file(&socket_path).ok();
-
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let listener = UnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
-
         std::fs::set_permissions(&socket_path, PermissionsExt::from_mode(0o600))?;
 
         tracing::info!("IPC socket started at {}", socket_path.display());
 
         let source = Generic::new(listener, Interest::READ, Mode::Level);
-        event_loop.insert_source(source, |_, listener, state| match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(true)?;
-                let mut client = IpcClient::new(stream);
-                client.process(state);
-                Ok(PostAction::Continue)
+        event_loop.insert_source(source, |_, listener, state| {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => accept_client(state, stream),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    // A transient accept error (e.g. fd exhaustion) must never
+                    // tear down the compositor — log and keep serving.
+                    Err(e) => {
+                        tracing::warn!("IPC accept error: {e}");
+                        break;
+                    }
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(PostAction::Continue),
-            Err(e) => {
-                tracing::warn!("IPC accept error: {}", e);
-                Err(e)
-            }
+            Ok(PostAction::Continue)
         })?;
 
         Ok(Self { socket_path })
@@ -60,325 +73,221 @@ impl Drop for IpcServer {
     }
 }
 
-struct IpcClient {
-    stream: UnixStream,
-    buffer: Vec<u8>,
+/// Register an accepted connection as its own calloop source. The closure owns a
+/// per-connection read buffer so partial commands survive across event-loop ticks.
+fn accept_client(state: &mut DriftWm, stream: UnixStream) {
+    if let Err(e) = stream.set_nonblocking(true) {
+        tracing::warn!("IPC: failed to set client nonblocking: {e}");
+        return;
+    }
+    let mut buffer: Vec<u8> = Vec::with_capacity(256);
+    let source = Generic::new(stream, Interest::READ, Mode::Level);
+    // The callback hands a `&mut NoIoDrop<UnixStream>` which derefs to
+    // `&UnixStream`; its Read/Write impls take `&self`, so a shared ref suffices.
+    let registered = state
+        .loop_handle
+        .insert_source(source, move |_, stream, state| {
+            Ok(serve_connection(stream, &mut buffer, state))
+        });
+    if let Err(e) = registered {
+        tracing::warn!("IPC: failed to register client connection: {e}");
+    }
 }
 
-impl IpcClient {
-    fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            buffer: Vec::with_capacity(256),
-        }
-    }
-
-    fn process(&mut self, state: &mut DriftWm) {
-        let mut buf = [0u8; 512];
-        loop {
-            match self.stream.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => {
-                    self.buffer.extend_from_slice(&buf[..n]);
-                    if self.buffer.len() >= MAX_COMMAND_SIZE {
-                        tracing::warn!("IPC command too large, disconnecting");
-                        return;
-                    }
-                    if let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') {
-                        let line = String::from_utf8_lossy(&self.buffer[..newline]).to_string();
-                        self.buffer.drain(..=newline);
-                        let response = process_command(&line, state);
-                        let _ = self.stream.write_all(response.as_bytes());
-                        let _ = self.stream.write_all(b"\n");
-                        let _ = self.stream.flush();
-                        if self.buffer.is_empty() {
-                            return;
-                        }
+/// Drain everything readable, answering each complete `\n`-terminated command.
+fn serve_connection(
+    mut stream: &UnixStream,
+    buffer: &mut Vec<u8>,
+    state: &mut DriftWm,
+) -> PostAction {
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return PostAction::Remove, // EOF
+            Ok(n) => {
+                buffer.extend_from_slice(&chunk[..n]);
+                if buffer.len() > MAX_COMMAND_SIZE {
+                    tracing::warn!("IPC command too large, disconnecting");
+                    return PostAction::Remove;
+                }
+                while let Some(nl) = buffer.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buffer.drain(..=nl).collect();
+                    let reply = process_line(&line[..nl], state);
+                    if write_reply(stream, &reply).is_err() {
+                        return PostAction::Remove;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(e) => {
-                    tracing::warn!("IPC read error: {}", e);
-                    return;
-                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return PostAction::Continue,
+            Err(e) => {
+                tracing::warn!("IPC read error: {e}");
+                return PostAction::Remove;
             }
         }
     }
 }
 
-const MAX_COMMAND_SIZE: usize = 4096;
-
-fn process_command(command: &str, state: &mut DriftWm) -> String {
-    state.mark_all_dirty();
-    let command = command.trim();
-    if command.is_empty() {
-        return json_response("error", "empty command");
-    }
-
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() {
-        return json_response("error", "empty command");
-    }
-
-    match parts[0] {
-        "camera" => handle_camera(parts, state),
-        "zoom" => handle_zoom(parts, state),
-        "layout" => handle_layout(parts, state),
-        "state" => handle_state(state),
-        "quit" => handle_quit(state),
-        "focus" => handle_focus(parts, state),
-        "close" => handle_close(state),
-        "move" => handle_move(parts, state),
-        _ => json_response("error", format!("unknown command: {}", parts[0])),
-    }
+fn process_line(line: &[u8], state: &mut DriftWm) -> Reply {
+    let request: Request =
+        serde_json::from_slice(line).map_err(|e| format!("invalid request: {e}"))?;
+    dispatch(request, state)
 }
 
-fn handle_camera(args: Vec<&str>, state: &mut DriftWm) -> String {
-    if args.len() == 1 {
-        let (x, y) = camera_position(state);
-        json_response(
-            "ok",
-            serde_json::json!({
-                "camera": {"x": x, "y": y}
-            }),
-        )
-    } else if args.len() == 3 {
-        let x: f64 = match args[1].parse() {
-            Ok(v) => v,
-            Err(_) => return json_response("error", "x must be number"),
-        };
-        let y: f64 = match args[2].parse() {
-            Ok(v) => v,
-            Err(_) => return json_response("error", "y must be number"),
-        };
-
-        let target = Point::from((x, y));
-        state.set_camera_target(Some(target));
-
-        json_response(
-            "ok",
-            serde_json::json!({
-                "camera": {"x": x, "y": y}
-            }),
-        )
-    } else {
-        json_response("error", "camera takes 0 or 2 args")
+fn dispatch(request: Request, state: &mut DriftWm) -> Reply {
+    // The animated setters (Camera/Zoom) only stash a target — they don't
+    // self-schedule a frame — so every state-changing command needs the kick.
+    // Pure queries don't, and shouldn't force a redraw.
+    if is_mutating(&request) {
+        state.mark_all_dirty();
     }
-}
 
-fn handle_zoom(args: Vec<&str>, state: &mut DriftWm) -> String {
-    if args.len() == 1 {
-        json_response(
-            "ok",
-            serde_json::json!({
-                "zoom": zoom_level(state)
-            }),
-        )
-    } else if args.len() == 2 {
-        let zoom: f64 = match args[1].parse() {
-            Ok(v) => v,
-            Err(_) => return json_response("error", "zoom must be number"),
-        };
-
-        if !(0.1..=10.0).contains(&zoom) {
-            return json_response("error", "zoom must be 0.1-10.0");
+    match request {
+        Request::Camera(arg) => cmd_camera(arg, state),
+        Request::Zoom(arg) => cmd_zoom(arg, state),
+        Request::Layout => Ok(Response::Layout(state.active_layout.clone())),
+        Request::State => Ok(cmd_state(state)),
+        Request::Focus(arg) => cmd_focus(arg, state),
+        Request::Close => cmd_close(state),
+        Request::Move(arg) => cmd_move(arg, state),
+        Request::Quit => {
+            tracing::info!("IPC quit received, shutting down");
+            state.loop_signal.stop();
+            Ok(Response::Ok)
         }
-
-        state.set_zoom_target(Some(zoom));
-
-        json_response(
-            "ok",
-            serde_json::json!({
-                "zoom": zoom
-            }),
-        )
-    } else {
-        json_response("error", "zoom takes 0 or 1 arg")
     }
 }
 
-fn handle_layout(args: Vec<&str>, state: &mut DriftWm) -> String {
-    if args.len() == 1 {
-        json_response(
-            "ok",
-            serde_json::json!({
-                "layout": state.active_layout
-            }),
-        )
-    } else {
-        json_response(
-            "error",
-            "layout write not yet implemented (requires XKB switch action)",
-        )
-    }
-}
-
-fn handle_state(state: &mut DriftWm) -> String {
-    let mut windows = Vec::new();
-    for window in state.space.elements() {
-        let loc = state.space.element_location(window).unwrap_or_default();
-        let size = window.geometry().size;
-        let (x, y) = driftwm::canvas::internal_to_rule(loc, size);
-        let app_id = window.app_id_or_class();
-        windows.push(serde_json::json!({
-            "app_id": app_id.unwrap_or_else(|| "unknown".to_string()),
-            "x": x,
-            "y": y,
-            "width": size.w,
-            "height": size.h,
-        }));
-    }
-
-    let (cx, cy) = camera_position(state);
-    let zoom = zoom_level(state);
-
-    json_response(
-        "ok",
-        serde_json::json!({
-            "camera": {"x": cx, "y": cy},
-            "zoom": zoom,
-            "windows": windows,
-            "window_count": windows.len(),
-        }),
+fn is_mutating(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Camera(Some(_))
+            | Request::Zoom(Some(_))
+            | Request::Focus(Some(_))
+            | Request::Close
+            | Request::Move(Some(_))
     )
 }
 
-fn handle_quit(state: &mut DriftWm) -> String {
-    tracing::info!("IPC quit command received, shutting down");
-    state.loop_signal.stop();
-    json_response(
-        "ok",
-        serde_json::json!({
-            "status": "shutting down"
-        }),
-    )
-}
-
-fn handle_focus(args: Vec<&str>, state: &mut DriftWm) -> String {
-    if args.len() == 1 {
-        if let Some(window) = state.focused_window() {
-            let app_id = window
-                .app_id_or_class()
-                .unwrap_or_else(|| "unknown".to_string());
-            json_response(
-                "ok",
-                serde_json::json!({
-                    "focused": app_id
-                }),
-            )
-        } else {
-            json_response(
-                "ok",
-                serde_json::json!({
-                    "focused": null
-                }),
-            )
+fn cmd_camera(arg: Option<(f64, f64)>, state: &mut DriftWm) -> Reply {
+    match arg {
+        None => {
+            let (x, y) = camera_center(state);
+            Ok(Response::Camera { x, y })
         }
-    } else if args.len() == 2 {
-        let target = args[1].to_lowercase();
-        let mut found = None;
-        for window in state.space.elements() {
-            if let Some(app_id) = window.app_id_or_class()
-                && app_id.to_lowercase().contains(&target)
-            {
-                found = Some((window.clone(), app_id));
-                break;
-            }
+        Some((x, y)) => {
+            // (x, y) is the viewport center, Y-up; map it to the internal camera
+            // target so the viewport ends up centered there.
+            let target =
+                driftwm::canvas::camera_for_center(x, y, state.zoom(), state.get_viewport_size());
+            state.set_camera_target(Some(target));
+            Ok(Response::Camera { x, y })
         }
-
-        if let Some((window, app_id)) = found {
-            // Already on screen: just raise and focus. Otherwise move the camera
-            // to it, honoring [zoom] reset_on_activation (matches xdg_shell focus).
-            if state.window_fully_in_viewport(&window) {
-                state.raise_and_focus(&window, SERIAL_COUNTER.next_serial());
-            } else {
-                state.navigate_to_window(&window, state.config.zoom_reset_on_activation);
-            }
-            json_response(
-                "ok",
-                serde_json::json!({
-                    "focused": app_id
-                }),
-            )
-        } else {
-            json_response("error", format!("no window matching '{}'", target))
-        }
-    } else {
-        json_response("error", "focus takes 0 or 1 arg (app_id)")
     }
 }
 
-fn handle_close(state: &mut DriftWm) -> String {
-    if let Some(window) = state.focused_window().filter(|w| !w.is_widget()) {
-        let app_id = window
-            .app_id_or_class()
-            .unwrap_or_else(|| "unknown".to_string());
-        window.send_close();
-        json_response(
-            "ok",
-            serde_json::json!({
-                "closed": app_id
-            }),
-        )
-    } else {
-        json_response("error", "no focused window to close")
+fn cmd_zoom(arg: Option<f64>, state: &mut DriftWm) -> Reply {
+    match arg {
+        None => Ok(Response::Zoom(state.zoom())),
+        Some(zoom) => {
+            if !zoom.is_finite() || zoom <= 0.0 {
+                return Err("zoom must be a positive number".to_string());
+            }
+            // Same bounds as keyboard/gesture zoom; reply reports what was applied.
+            let clamped = zoom.clamp(state.min_zoom(), driftwm::canvas::MAX_ZOOM);
+            // Anchor on the viewport center (like keyboard zoom) so the center
+            // stays put — otherwise zoom drifts the camera off the `camera` point.
+            state.zoom_to_anchored(clamped);
+            Ok(Response::Zoom(clamped))
+        }
     }
 }
 
-fn handle_move(args: Vec<&str>, state: &mut DriftWm) -> String {
-    if args.len() == 1 {
-        if let Some(window) = state.focused_window() {
+fn cmd_state(state: &mut DriftWm) -> Response {
+    let windows = state.window_inventory();
+    Response::State {
+        camera: camera_center(state),
+        zoom: state.zoom(),
+        windows,
+    }
+}
+
+fn cmd_focus(arg: Option<String>, state: &mut DriftWm) -> Reply {
+    match arg {
+        None => Ok(Response::Focused(
+            state.focused_window().and_then(|w| w.app_id_or_class()),
+        )),
+        Some(target) => {
+            let target = target.to_lowercase();
+            let found = state
+                .space
+                .elements()
+                .find(|w| {
+                    !w.is_widget()
+                        && w.app_id_or_class()
+                            .is_some_and(|a| a.to_lowercase().contains(&target))
+                })
+                .cloned();
+
+            match found {
+                Some(window) => {
+                    let app_id = window.app_id_or_class();
+                    // Already on screen: just raise + focus, don't move the camera.
+                    if state.window_fully_in_viewport(&window) {
+                        state.raise_and_focus(&window, SERIAL_COUNTER.next_serial());
+                    } else {
+                        state.navigate_to_window(&window, state.config.zoom_reset_on_activation);
+                    }
+                    Ok(Response::Focused(app_id))
+                }
+                None => Err(format!("no window matching '{target}'")),
+            }
+        }
+    }
+}
+
+fn cmd_close(state: &mut DriftWm) -> Reply {
+    match state.focused_window().filter(|w| !w.is_widget()) {
+        Some(window) => {
+            window.send_close();
+            Ok(Response::Ok)
+        }
+        None => Err("no focused window to close".to_string()),
+    }
+}
+
+fn cmd_move(arg: Option<(i32, i32)>, state: &mut DriftWm) -> Reply {
+    let Some(window) = state.focused_window() else {
+        return Err("no focused window".to_string());
+    };
+    let size = window.geometry().size;
+    match arg {
+        None => {
             let loc = state.space.element_location(&window).unwrap_or_default();
-            let size = window.geometry().size;
             let (x, y) = driftwm::canvas::internal_to_rule(loc, size);
-            json_response("ok", serde_json::json!({ "x": x, "y": y }))
-        } else {
-            json_response("error", "no focused window")
+            Ok(Response::Position { x, y })
         }
-    } else if args.len() == 3 {
-        let x: i32 = match args[1].parse() {
-            Ok(v) => v,
-            Err(_) => return json_response("error", "x must be integer"),
-        };
-        let y: i32 = match args[2].parse() {
-            Ok(v) => v,
-            Err(_) => return json_response("error", "y must be integer"),
-        };
-
-        if let Some(window) = state.focused_window() {
-            let size = window.geometry().size;
+        Some((x, y)) => {
             let loc = driftwm::canvas::rule_to_internal(x, y, size);
             state.space.map_element(window, loc, true);
-            json_response("ok", serde_json::json!({ "x": x, "y": y }))
-        } else {
-            json_response("error", "no focused window to move")
+            Ok(Response::Position { x, y })
         }
-    } else {
-        json_response("error", "move takes 0 or 2 args (x y)")
     }
 }
 
-fn camera_position(state: &mut DriftWm) -> (f64, f64) {
-    state
-        .active_output()
-        .map(|o| {
-            let os = output_state(&o);
-            (os.camera.x, os.camera.y)
-        })
-        .unwrap_or((0.0, 0.0))
+/// Serialize and send a reply. Switches to a bounded blocking write so a large
+/// reply isn't truncated on `WouldBlock` and a stuck reader can't hang the loop.
+fn write_reply(mut stream: &UnixStream, reply: &Reply) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(reply)?;
+    bytes.push(b'\n');
+    stream.set_nonblocking(false).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+    let res = stream.write_all(&bytes);
+    stream.set_nonblocking(true).ok();
+    res
 }
 
-fn zoom_level(state: &mut DriftWm) -> f64 {
-    state
-        .active_output()
-        .map(|o| output_state(&o).zoom)
-        .unwrap_or(1.0)
-}
-
-fn json_response(status: &str, data: impl Into<serde_json::Value>) -> String {
-    serde_json::json!({
-        "status": status,
-        "data": data.into(),
-    })
-    .to_string()
+/// The viewport center, Y-up — same representation as the state file, so `camera`,
+/// `state`, and the state file all agree.
+fn camera_center(state: &DriftWm) -> (f64, f64) {
+    driftwm::canvas::viewport_center(state.camera(), state.zoom(), state.get_viewport_size())
 }

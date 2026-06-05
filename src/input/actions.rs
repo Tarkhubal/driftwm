@@ -436,7 +436,7 @@ impl DriftWm {
     }
 
     /// Animate zoom to `target_zoom`, anchored on viewport center (for keyboard actions).
-    fn zoom_to_anchored(&mut self, target_zoom: f64) {
+    pub(crate) fn zoom_to_anchored(&mut self, target_zoom: f64) {
         self.set_overview_return(None);
         let vc = self.usable_center_screen();
         let camera = self.camera();

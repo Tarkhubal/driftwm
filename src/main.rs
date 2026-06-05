@@ -11,8 +11,42 @@ mod state;
 mod surface_tree;
 mod xwayland;
 
+use clap::Parser;
 use state::{ClientState, DriftWm};
 use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(
+    name = "driftwm",
+    version,
+    about,
+    after_help = concat!("Documentation & source: ", env!("CARGO_PKG_REPOSITORY"))
+)]
+struct Cli {
+    /// Backend to use [default: udev on a TTY, winit if nested]
+    #[arg(long, value_name = "udev|winit")]
+    backend: Option<String>,
+    /// Use an alternate config file
+    #[arg(long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+    /// Validate the config and exit
+    #[arg(long)]
+    check_config: bool,
+    #[command(subcommand)]
+    command: Option<Sub>,
+}
+
+#[derive(clap::Subcommand)]
+enum Sub {
+    /// Send a command to the running compositor
+    Msg {
+        /// Print the raw JSON reply
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        msg: ipc::client::Msg,
+    },
+}
 
 /// Wrap the system allocator with Tracy's profiled allocator when the
 /// allocations feature is on. Tracks every allocation on the timeline; only
@@ -23,6 +57,18 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    // `driftwm msg ...` runs as a client and exits — before any backend, event
+    // loop, or signal blocking.
+    if let Some(Sub::Msg { json, msg }) = &cli.command {
+        if let Err(e) = ipc::client::run(msg, *json) {
+            eprintln!("driftwm msg: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Block SIGINT/SIGTERM/SIGHUP before any threads spawn so they're
     // delivered via signalfd (see signals::listen) instead of killing the
     // process. Child threads inherit the mask; spawn_command clears it for
@@ -41,57 +87,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    if std::env::args().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "driftwm {} — {}\n\
-             \n\
-             USAGE:\n    \
-                 driftwm [OPTIONS]\n\
-             \n\
-             OPTIONS:\n    \
-                 --backend <udev|winit>   Backend (default: udev on TTY, winit if nested)\n    \
-                 --config <path>          Use an alternate config file\n    \
-                 --check-config           Validate config and exit\n    \
-                 -V, --version            Print version\n    \
-                 -h, --help               Print this help\n\
-             \n\
-             {}",
-            env!("CARGO_PKG_VERSION"),
-            env!("CARGO_PKG_DESCRIPTION"),
-            env!("CARGO_PKG_REPOSITORY"),
-        );
-        return Ok(());
-    }
-
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("driftwm {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    if std::env::args().any(|a| a == "--check-config") {
+    if cli.check_config {
         let _config = driftwm::config::Config::load();
         tracing::info!("Config OK");
         return Ok(());
     }
 
     // --config <path>: override config file (useful for nested/test sessions).
-    if let Some(path) = std::env::args().skip_while(|a| a != "--config").nth(1) {
-        unsafe { std::env::set_var("DRIFTWM_CONFIG", &path) };
+    if let Some(path) = &cli.config {
+        unsafe { std::env::set_var("DRIFTWM_CONFIG", path) };
     }
 
     // --backend: default udev on bare metal, winit if nested.
-    let backend_name = std::env::args()
-        .skip_while(|a| a != "--backend")
-        .nth(1)
-        .unwrap_or_else(|| {
-            if std::env::var_os("WAYLAND_DISPLAY").is_some()
-                || std::env::var_os("DISPLAY").is_some()
-            {
-                "winit".to_string()
-            } else {
-                "udev".to_string()
-            }
-        });
+    let backend_name = cli.backend.clone().unwrap_or_else(|| {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+            "winit".to_string()
+        } else {
+            "udev".to_string()
+        }
+    });
 
     let mut event_loop: smithay::reexports::calloop::EventLoop<DriftWm> =
         smithay::reexports::calloop::EventLoop::try_new()?;
@@ -107,12 +121,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.handle(),
         event_loop.get_signal(),
     );
-
-    // Initialize IPC server
-    match crate::ipc::IpcServer::new(&event_loop.handle()) {
-        Ok(server) => data.ipc_server = Some(server),
-        Err(e) => tracing::warn!("IPC server failed to start: {}", e),
-    }
 
     // Initialize backend BEFORE setting WAYLAND_DISPLAY.
     match backend_name.as_str() {
@@ -155,6 +163,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     data.config
         .child_env
         .insert("WAYLAND_DISPLAY".to_string(), socket_name.clone());
+
+    // The IPC socket name derives from WAYLAND_DISPLAY, so start it now that the
+    // wayland display is known — this lets `driftwm msg` auto-target this instance.
+    match crate::ipc::IpcServer::new(&event_loop.handle(), &socket_name) {
+        Ok(server) => data.ipc_server = Some(server),
+        Err(e) => tracing::warn!("IPC server failed to start: {e}"),
+    }
 
     // Export only session-level vars to systemd and D-Bus. Pass them through
     // Command::env() rather than relying on process env — the policy is "don't
