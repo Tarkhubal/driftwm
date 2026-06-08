@@ -42,14 +42,14 @@ At least one criterion is required. All specified criteria must match.
 ### Finding a window's identifiers
 
 ```sh
-cat $XDG_RUNTIME_DIR/driftwm/state   # look for the "windows=" line
+driftwm msg state   # camera, zoom, and the window inventory
 ```
 
-To get titles and app ids of all current non-widget windows:
+To get the app ids and titles of all current non-widget windows:
 
 ```sh
-sed -n 's/^windows=//p' $XDG_RUNTIME_DIR/driftwm/state | \
-jq '.[] | select(.is_widget == false) | {app_id, title}'
+driftwm msg --json state | \
+jq '.Ok.State.windows[] | select(.is_widget == false) | {app_id, title}'
 ```
 
 ## Pattern syntax
@@ -72,30 +72,30 @@ The table below describes how each field behaves on rules matching regular
 windows (xdg-toplevels). Layer-shell surfaces interpret chrome fields
 differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 
-| Field                  | Type                     | Default   | Description                                                                                                                                              |
-| ---------------------- | ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up). Output-relative (origin = output center) when `pinned_to_screen` is set.                       |
-| `size`                 | `[w, h]`                 | —         | Initial window dimensions in pixels (one-shot: the user/app can resize freely afterwards; pair with `widget = true` to keep the size locked)             |
-| `widget`               | `bool`                   | `false`   | Pin window: immovable, below normal windows, excluded from navigation/alt-tab                                                                            |
-| `pinned_to_screen`     | `bool`                   | `false`   | Pin to one output's screen space — see [Screen-pinned windows](#screen-pinned-windows)                                                                   |
-| `decoration`           | string                   | inherited | Override decoration mode (see below)                                                                                                                     |
-| `blur`                 | `bool`                   | `false`   | Blur compositor background behind this window                                                                                                            |
-| `opacity`              | `0.0`–`1.0`              | `1.0`     | Window transparency (1.0 = fully opaque)                                                                                                                 |
-| `border_width`         | px                       | inherited | Border width override. Set to `0` to disable the border even when global width is `> 0`. Ignored for `decoration = "none"`.                              |
-| `border_color`         | `"#rrggbb[aa]"`          | inherited | Per-window unfocused border color                                                                                                                        |
-| `border_color_focused` | `"#rrggbb[aa]"`          | inherited | Per-window focused border color                                                                                                                          |
-| `corner_radius`        | px                       | inherited | Per-window corner radius override. Affects content clip, border shape, and shadow. Ignored for `decoration = "none"`.                                    |
-| `shadow`               | `bool`                   | inherited | Per-window shadow toggle. Overrides `[decorations] shadow`. Ignored for `decoration = "none"`.                                                           |
-| `pass_keys`            | `bool` or `["combo", …]` | `false`   | Forward keys to the app — see below                                                                                                                      |
+| Field                  | Type                     | Default   | Description                                                                                                                                  |
+| ---------------------- | ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up). Output-relative (origin = output center) when `pinned_to_screen` is set.           |
+| `size`                 | `[w, h]`                 | —         | Initial window dimensions in pixels (one-shot: the user/app can resize freely afterwards; pair with `widget = true` to keep the size locked) |
+| `widget`               | `bool`                   | `false`   | Pin window: immovable, below normal windows, excluded from navigation/alt-tab                                                                |
+| `pinned_to_screen`     | `bool`                   | `false`   | Pin to one output's screen space — see [Screen-pinned windows](#screen-pinned-windows)                                                       |
+| `decoration`           | string                   | inherited | Override decoration mode (see below)                                                                                                         |
+| `blur`                 | `bool`                   | `false`   | Blur compositor background behind this window                                                                                                |
+| `opacity`              | `0.0`–`1.0`              | `1.0`     | Window transparency (1.0 = fully opaque)                                                                                                     |
+| `border_width`         | px                       | inherited | Border width override. Set to `0` to disable the border even when global width is `> 0`. Ignored for `decoration = "none"`.                  |
+| `border_color`         | `"#rrggbb[aa]"`          | inherited | Per-window unfocused border color                                                                                                            |
+| `border_color_focused` | `"#rrggbb[aa]"`          | inherited | Per-window focused border color                                                                                                              |
+| `corner_radius`        | px                       | inherited | Per-window corner radius override. Affects content clip, border shape, and shadow. Ignored for `decoration = "none"`.                        |
+| `shadow`               | `bool`                   | inherited | Per-window shadow toggle. Overrides `[decorations] shadow`. Ignored for `decoration = "none"`.                                               |
+| `pass_keys`            | `bool` or `["combo", …]` | `false`   | Forward keys to the app — see below                                                                                                          |
 
 ### `decoration` values
 
-| Value          | Description                                                                                              |
-| -------------- | -------------------------------------------------------------------------------------------------------- |
-| `"client"`     | CSD — client draws its own titlebar (default)                                                            |
-| `"server"`     | SSD — driftwm draws a titlebar with the window title and a close button                                  |
-| `"minimal"`    | SSD — no titlebar; shadow, corner clip, and border still apply per `[decorations]` / per-window rules    |
-| `"none"`       | Bare client surface — compositor adds zero chrome; per-window border/corner/shadow rules are ignored too |
+| Value       | Description                                                                                              |
+| ----------- | -------------------------------------------------------------------------------------------------------- |
+| `"client"`  | CSD — client draws its own titlebar (default)                                                            |
+| `"server"`  | SSD — driftwm draws a titlebar with the window title and a close button                                  |
+| `"minimal"` | SSD — no titlebar; shadow, corner clip, and border still apply per `[decorations]` / per-window rules    |
+| `"none"`    | Bare client surface — compositor adds zero chrome; per-window border/corner/shadow rules are ignored too |
 
 ### Screen-pinned windows
 
@@ -116,19 +116,44 @@ floating overlay.
   unpins the window to fill the screen; exiting fullscreen re-pins it in place.
   Any canvas pan/zoom exits fullscreen, just like a normal window.
 - **Off the canvas.** Pinned windows are excluded from navigation, alt-tab,
-  snapping, fit/center actions, and canvas screenshots (`driftwm msg
-  screenshot`). They remain focusable and closable; SSD windows show a small dot
-  in the title bar.
+  snapping, fit/center actions, and canvas screenshots
+  (`driftwm msg screenshot`). They remain focusable and closable; SSD windows
+  show a small dot in the title bar.
 - **Toggle at runtime** with the `toggle-pin-to-screen` action (bound to `Mod+T`
   by default), which pins/unpins the focused window in place.
 
+#### Finding a pinned window's position and size
+
+`position`/`size` are screen-space. The easiest way is to pin the window live,
+drag it where you want, then read the numbers back to bake into a rule:
+
+1. Open the window (e.g. start Picture-in-Picture), click it to focus, and press
+   `Mod+T` to pin it. It's now in screen space — drag it anywhere with the mouse
+   and resize to taste.
+2. Once it sits where you want, press `Mod+A` (home) to bring the viewport to the
+   canvas origin at zoom 1.0. The pinned window stays put on screen.
+3. Press `Mod+T` again to unpin. At home the window drops back onto the canvas at
+   the same on-screen spot, and one canvas unit is one screen pixel, so its
+   canvas coords now equal its screen position.
+4. Run `driftwm msg state` and copy the window's `app_id`, `title`, `position`,
+   and `size`.
+5. Write the rule with those values plus `pinned_to_screen = true` (and
+   `decoration = "none"` for a chrome-free PiP surface).
+
 ```toml
-# Firefox Picture-in-Picture, pinned 300px below the output center.
 [[window_rules]]
 title            = "Picture-in-Picture"
 pinned_to_screen = true
-position         = [0, -300]
+position         = [540, -350]
+size             = [570, 320]
+decoration       = "none"
 ```
+
+You have to unpin before reading (step 3): pinned windows live in screen space,
+not on the canvas, so — like layer-shell panels — they're deliberately absent
+from `driftwm msg state` and canvas screenshots. If you run top/bottom bars,
+`Mod+A` centers the _usable_ area rather than the raw output, so the result can
+sit a little off — nudge `position` to taste.
 
 ### Layer-shell surfaces
 
@@ -228,17 +253,6 @@ app_id   = "myapp-panel"
 size     = [400, 800]
 position = [960, 0]
 widget   = true
-```
-
-### Match by both app_id and title
-
-Both criteria must match simultaneously:
-
-```toml
-[[window_rules]]
-app_id = "firefox"
-title  = "Picture-in-Picture"
-widget = true
 ```
 
 ### Composing rules (multi-rule merge)
