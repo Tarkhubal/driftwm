@@ -211,7 +211,6 @@ fn momentum_velocity_tracker_launch() {
     }
     m.launch();
     // 5 samples over 40ms, total displacement = 50px → velocity ≈ 1250 px/sec.
-    // 120Hz floor = (5-1)/120 ≈ 0.0333s; real elapsed = 0.040s > floor, so no clamping.
     assert!(
         (m.velocity.x - 1250.0).abs() < 50.0,
         "expected ~1250 px/sec, got {}",
@@ -282,24 +281,37 @@ fn momentum_frame_rate_independence() {
 }
 
 #[test]
-fn momentum_compressed_burst_velocity_is_bounded() {
-    // Regression: before the 120Hz elapsed floor, draining a burst of input events
-    // with near-identical processing timestamps collapsed elapsed → 0 and launched
-    // the canvas at hundreds-of-thousands px/sec. This test pushes 30 samples all
-    // stamped at the same millisecond (worst case) and asserts the resulting velocity
-    // is physically bounded by the floor: 150px total / ((30-1)/120 s) ≈ 620 px/sec.
+fn momentum_sub_millisecond_window_does_not_runaway() {
+    // A window collapsed into a single millisecond (degenerate >1000Hz sub-ms
+    // flick) can't yield a trustworthy velocity from ms-quantized timestamps, so
+    // we bail to zero rather than divide-by-zero into an explosive fling.
     let mut m = MomentumState::new(0.96);
     for _ in 0..30 {
         m.accumulate(Point::from((5.0, 0.0)), 1000);
     }
     m.launch();
-    assert!(
-        m.velocity.x > 0.0,
-        "velocity should be positive after burst"
+    assert_eq!(
+        m.velocity,
+        Point::from((0.0, 0.0)),
+        "same-ms window must not fling; got {:?}",
+        m.velocity
     );
+}
+
+#[test]
+fn momentum_high_polling_rate_is_not_throttled() {
+    // Regression: a fixed (n-1)/120Hz elapsed floor divided fling velocity on any
+    // device above ~125Hz. A 1000Hz mouse fling (80 samples, 1ms apart, 10px each)
+    // spans 79ms → ~10127 px/sec. The old floor capped it at 800/((80-1)/120) ≈
+    // 1215 px/sec, an ~8x throttle. With real event timestamps it must not clamp.
+    let mut m = MomentumState::new(0.96);
+    for i in 0..80u32 {
+        m.accumulate(Point::from((10.0, 0.0)), i);
+    }
+    m.launch();
     assert!(
-        m.velocity.x < 5000.0,
-        "compressed burst must not produce explosive velocity; got {} px/sec",
+        m.velocity.x > 5000.0,
+        "high-polling fling must not be rate-clamped; got {} px/sec",
         m.velocity.x
     );
 }

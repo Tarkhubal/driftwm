@@ -291,15 +291,13 @@ pub fn find_nearest<W: PartialEq>(
 /// Timestamps are libinput event times (ms), not processing time: under CPU
 /// load the event loop can drain a burst of events with near-identical
 /// processing times, which collapses `elapsed` and explodes the launch velocity.
+/// Event times are stamped when the input occurred, so they retain real spacing.
 #[derive(Clone, Default)]
 pub struct VelocityTracker {
     samples: VecDeque<(u32, Point<f64, Logical>)>,
 }
 
 const VELOCITY_WINDOW_MS: u32 = 80;
-/// Fastest input rate we trust (Hz). Floors `elapsed` so a compressed burst of
-/// timestamps can't yield a physically impossible launch velocity.
-const MAX_INPUT_RATE_HZ: f64 = 120.0;
 
 impl VelocityTracker {
     pub fn new() -> Self {
@@ -326,10 +324,14 @@ impl VelocityTracker {
         let first_time = self.samples.front().unwrap().0;
         let last_time = self.samples.back().unwrap().0;
         let elapsed_ms = last_time.wrapping_sub(first_time);
-        // Floor elapsed at the fastest input rate we trust: a CPU-stalled burst
-        // of near-simultaneous timestamps can't fling faster than real input.
-        let min_elapsed = (self.samples.len() as f64 - 1.0) / MAX_INPUT_RATE_HZ;
-        let elapsed = (elapsed_ms as f64 / 1000.0).max(min_elapsed);
+        // Event times are ms-quantized, so a sub-ms window (only reachable by a
+        // sub-millisecond flick on a >1000Hz device) would divide by zero. Guard
+        // the clock resolution, not a device rate: any real fling spans many ms,
+        // so no device is throttled.
+        if elapsed_ms == 0 {
+            return Point::from((0.0, 0.0));
+        }
+        let elapsed = elapsed_ms as f64 / 1000.0;
         let total: Point<f64, Logical> = self
             .samples
             .iter()
