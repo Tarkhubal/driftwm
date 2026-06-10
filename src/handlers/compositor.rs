@@ -47,22 +47,7 @@ impl CompositorHandler for DriftWm {
     ) {
         // Safety net for crash path — toplevel_destroyed handles normal xdg
         // shutdown, but a client crash destroys wl_surface without it.
-        let id = surface.id();
-        self.decorations.remove(&id);
-        self.pinned.remove(&id);
-        self.pending_ssd.remove(&id);
-        self.pending_recenter.remove(&id);
-        self.auto_anchor_snapshot.remove(surface);
-        // Drop snapshots pointing at the destroyed surface as their anchor.
-        // Keep `None`-anchor entries (user had no focus — unrelated).
-        self.auto_anchor_snapshot
-            .retain(|_, anchor| match anchor.as_ref() {
-                None => true,
-                Some(w) => w.wl_surface().is_some_and(|s| &*s != surface),
-            });
-        self.render.blur_cache.remove(&id);
-        self.render.shadow_cache.remove(&id);
-        self.render.border_cache.remove(&id);
+        self.cleanup_surface_state(surface);
         // lock_surfaces is keyed by output — sweep values.
         self.lock_surfaces
             .retain(|_, ls| ls.wl_surface() != surface);

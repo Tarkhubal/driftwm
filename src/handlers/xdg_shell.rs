@@ -215,21 +215,6 @@ impl XdgShellHandler for DriftWm {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface().clone();
-        self.decorations.remove(&wl_surface.id());
-        self.pinned.remove(&wl_surface.id());
-        self.render.shadow_cache.remove(&wl_surface.id());
-        self.render.border_cache.remove(&wl_surface.id());
-        self.pending_ssd.remove(&wl_surface.id());
-        self.pending_center.remove(&wl_surface);
-        self.pending_size.remove(&wl_surface);
-        self.pending_fit.remove(&wl_surface);
-        self.pending_fullscreen.remove(&wl_surface);
-        self.pending_recenter.remove(&wl_surface.id());
-        self.image_copy_capture_state.remove_toplevel(&wl_surface);
-        // Drop cached capture texture/damage tracker for this surface.
-        self.render
-            .capture_state
-            .remove(&format!("cap-tl:{:?}", wl_surface.id()));
         // Collect first to avoid holding an immutable borrow on space
         let window = self
             .space
@@ -357,7 +342,10 @@ impl XdgShellHandler for DriftWm {
             // now that it's gone so clicks don't fall into the destroyed surface.
             self.refresh_pointer_focus();
         }
-        self.stable_snap_rects.remove(&wl_surface.id());
+        // Must run after the focus-follow block above: that derives the dying
+        // window's snap rect from stable_snap_rects (and, on a cache miss, live
+        // geometry reading its decorations/pinned entries), so clear last.
+        self.cleanup_surface_state(&wl_surface);
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, serial: Serial) {

@@ -633,6 +633,39 @@ impl DriftWm {
         }
     }
 
+    /// Drop every per-surface map/cache entry keyed by `surface`. Shared by the
+    /// normal and crash shutdown paths so the two can't drift apart and leak.
+    /// Pure removal — focus/fullscreen recovery stays at the call sites. Safe on
+    /// non-toplevel surfaces: the extra lookups just miss.
+    pub fn cleanup_surface_state(&mut self, surface: &WlSurface) {
+        let id = surface.id();
+        self.decorations.remove(&id);
+        self.pinned.remove(&id);
+        self.pending_ssd.remove(&id);
+        self.pending_recenter.remove(&id);
+        self.stable_snap_rects.remove(&id);
+        self.pending_center.remove(surface);
+        self.pending_size.remove(surface);
+        self.pending_fit.remove(surface);
+        self.pending_fullscreen.remove(surface);
+        self.render.blur_cache.remove(&id);
+        self.render.shadow_cache.remove(&id);
+        self.render.border_cache.remove(&id);
+        // capture_state keys this surface's texture/damage tracker under "cap-tl:".
+        self.render
+            .capture_state
+            .remove(&format!("cap-tl:{:?}", id));
+        self.image_copy_capture_state.remove_toplevel(surface);
+        self.auto_anchor_snapshot.remove(surface);
+        // Drop snapshots pointing at the destroyed surface as their anchor.
+        // Keep `None`-anchor entries (user had no focus — unrelated).
+        self.auto_anchor_snapshot
+            .retain(|_, anchor| match anchor.as_ref() {
+                None => true,
+                Some(w) => w.wl_surface().is_some_and(|s| &*s != surface),
+            });
+    }
+
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
