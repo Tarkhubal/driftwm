@@ -178,8 +178,8 @@ impl DriftWm {
             (c, errs)
         };
         let mut init_errors: BTreeMap<ErrorSource, String> = BTreeMap::new();
-        if let Some(first) = config_errors.first() {
-            init_errors.insert(ErrorSource::Config, first.clone());
+        if let Some(msg) = super::errors::summarize_config_errors(&config_errors) {
+            init_errors.insert(ErrorSource::Config, msg);
         }
 
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "seat-0");
@@ -195,9 +195,32 @@ impl DriftWm {
             model: &kb.model,
             ..Default::default()
         };
-        let keyboard = seat
-            .add_keyboard(xkb, config.repeat_delay, config.repeat_rate)
-            .expect("Failed to add keyboard");
+        let keyboard = match seat.add_keyboard(xkb, config.repeat_delay, config.repeat_rate) {
+            Ok(keyboard) => keyboard,
+            Err(err) => {
+                tracing::error!(
+                    "Invalid keyboard config (layout={:?} variant={:?} options={:?} model={:?}), \
+                     falling back to default: {err:?}",
+                    kb.layout,
+                    kb.variant,
+                    kb.options,
+                    kb.model,
+                );
+                init_errors.insert(
+                    ErrorSource::Keyboard,
+                    "keyboard: invalid layout config — using default (us)".into(),
+                );
+                // Explicit "us" rather than XkbConfig::default(): an empty layout
+                // defers to XKB_DEFAULT_LAYOUT, which could be the same garbage we
+                // just rejected.
+                let fallback = XkbConfig {
+                    layout: "us",
+                    ..Default::default()
+                };
+                seat.add_keyboard(fallback, config.repeat_delay, config.repeat_rate)
+                    .expect("default keyboard layout 'us' failed to compile")
+            }
+        };
         keyboard.set_modifier_state(ModifiersState {
             num_lock: config.num_lock,
             caps_lock: config.caps_lock,

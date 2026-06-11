@@ -4,6 +4,16 @@
 
 use super::DriftWm;
 
+/// Collapse config warnings into one line for the error bar (the bar has room
+/// for one; the full list stays in the log): first message, plus `(+N more)`.
+pub fn summarize_config_errors(warnings: &[String]) -> Option<String> {
+    let first = warnings.first()?;
+    Some(match warnings.len() {
+        1 => first.clone(),
+        n => format!("{first} (+{} more)", n - 1),
+    })
+}
+
 /// Source of a compositor-generated error shown in the on-screen error bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorSource {
@@ -11,6 +21,9 @@ pub enum ErrorSource {
     Config,
     /// Background image load/upload failure (falls back to the default shader).
     Background,
+    /// Invalid keyboard layout/variant/options/model (falls back to the default
+    /// layout at startup, or keeps the previous layout on reload).
+    Keyboard,
 }
 
 impl DriftWm {
@@ -29,5 +42,27 @@ impl DriftWm {
         if self.errors.remove(&source).is_some() {
             self.mark_all_dirty();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_config_errors;
+
+    #[test]
+    fn summarize_empty_is_none() {
+        assert_eq!(summarize_config_errors(&[]), None);
+    }
+
+    #[test]
+    fn summarize_single_is_verbatim() {
+        let w = vec!["bad thing".to_string()];
+        assert_eq!(summarize_config_errors(&w), Some("bad thing".to_string()));
+    }
+
+    #[test]
+    fn summarize_multiple_appends_count() {
+        let w = ["a", "b", "c"].map(String::from).to_vec();
+        assert_eq!(summarize_config_errors(&w), Some("a (+2 more)".to_string()));
     }
 }

@@ -17,6 +17,80 @@ use super::types::{
     WindowRule,
 };
 
+/// How actionable a config warning is. The error bar has room for one message,
+/// so `Rejected` (a value the compositor couldn't use) sorts ahead of
+/// `Corrected` (a value it auto-clamped to something usable). Declaration order
+/// is the sort order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Severity {
+    Rejected,
+    Corrected,
+}
+
+/// Config warnings tagged with severity; sorted by it before display.
+pub(super) type Warnings = Vec<(Severity, String)>;
+
+fn push_warn(errors: &mut Warnings, severity: Severity, msg: String) {
+    tracing::warn!("{msg}");
+    errors.push((severity, msg));
+}
+
+/// Warn about a value the compositor could not use (ignored or defaulted) — as
+/// opposed to one it auto-clamped; see [`Severity`].
+pub(super) fn collect_warn(errors: &mut Warnings, msg: String) {
+    push_warn(errors, Severity::Rejected, msg);
+}
+
+/// Clamp into `[min, max]`, warning when out of range so invalid numeric
+/// config is surfaced rather than silently corrected.
+pub(super) fn clamp_warn<T>(value: T, min: T, max: T, field: &str, errors: &mut Warnings) -> T
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    use std::cmp::Ordering;
+    // `partial_cmp` returns None for NaN; group it with the below-min case so an
+    // invalid float is clamped and surfaced instead of passing every comparison.
+    if matches!(value.partial_cmp(&min), None | Some(Ordering::Less)) {
+        push_warn(
+            errors,
+            Severity::Corrected,
+            format!("config: {field} {value} below minimum {min}, using {min}"),
+        );
+        min
+    } else if value > max {
+        push_warn(
+            errors,
+            Severity::Corrected,
+            format!("config: {field} {value} above maximum {max}, using {max}"),
+        );
+        max
+    } else {
+        value
+    }
+}
+
+/// Floor a value at zero, warning when it was negative (or NaN). For knobs with
+/// a natural lower bound but no upper limit (speeds, steps, distances, sizes).
+pub(super) fn non_negative<T>(value: T, field: &str, errors: &mut Warnings) -> T
+where
+    T: PartialOrd + std::fmt::Display + Copy + Default,
+{
+    let zero = T::default();
+    if matches!(
+        value.partial_cmp(&zero),
+        None | Some(std::cmp::Ordering::Less)
+    ) {
+        push_warn(
+            errors,
+            Severity::Corrected,
+            format!("config: {field} {value} is negative, using 0"),
+        );
+        zero
+    } else {
+        value
+    }
+}
+
 pub(super) fn parse_color(s: &str) -> Option<[u8; 4]> {
     let hex = s.strip_prefix('#')?;
     match hex.len() {
@@ -37,34 +111,63 @@ pub(super) fn parse_color(s: &str) -> Option<[u8; 4]> {
     }
 }
 
-pub(super) fn parse_output_outline(raw: OutputOutlineConfig) -> OutputOutlineSettings {
+pub(super) fn parse_output_outline(
+    raw: OutputOutlineConfig,
+    errors: &mut Warnings,
+) -> OutputOutlineSettings {
     let defaults = OutputOutlineSettings::default();
     let color = match raw.color {
         Some(s) => parse_color(&s).unwrap_or_else(|| {
-            tracing::warn!("Invalid output outline color '{s}', using default");
+            collect_warn(
+                errors,
+                format!("config: invalid output outline color '{s}', using default"),
+            );
             defaults.color
         }),
         None => defaults.color,
     };
     OutputOutlineSettings {
         color,
-        thickness: raw.thickness.unwrap_or(defaults.thickness).max(0),
-        opacity: raw.opacity.unwrap_or(defaults.opacity).clamp(0.0, 1.0),
+        thickness: clamp_warn(
+            raw.thickness.unwrap_or(defaults.thickness),
+            0,
+            i32::MAX,
+            "output.outline.thickness",
+            errors,
+        ),
+        opacity: clamp_warn(
+            raw.opacity.unwrap_or(defaults.opacity),
+            0.0,
+            1.0,
+            "output.outline.opacity",
+            errors,
+        ),
     }
 }
 
-pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationConfig {
-    let defaults = DecorationConfig::default();
+fn resolve_color(
+    opt: Option<String>,
+    default: [u8; 4],
+    name: &str,
+    errors: &mut Warnings,
+) -> [u8; 4] {
+    match opt {
+        Some(s) => parse_color(&s).unwrap_or_else(|| {
+            collect_warn(
+                errors,
+                format!("config: invalid {name} color '{s}', using default"),
+            );
+            default
+        }),
+        None => default,
+    }
+}
 
-    let resolve = |opt: Option<String>, default: [u8; 4], name: &str| -> [u8; 4] {
-        match opt {
-            Some(s) => parse_color(&s).unwrap_or_else(|| {
-                tracing::warn!("Invalid {name} color '{s}', using default");
-                default
-            }),
-            None => default,
-        }
-    };
+pub(super) fn parse_decoration_config(
+    raw: DecorationFileConfig,
+    errors: &mut Warnings,
+) -> DecorationConfig {
+    let defaults = DecorationConfig::default();
 
     let default_mode = match raw.default_mode.as_deref() {
         Some("client") | None => DecorationMode::Client,
@@ -74,15 +177,20 @@ pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationCo
             // Reserved for per-window rules. As a global default it's a footgun:
             // GTK/Electron toolkits ignore xdg-decoration and keep drawing CSD,
             // producing a double title bar.
-            tracing::warn!(
-                "default_mode = \"server\" is not supported globally (many toolkits \
-                 ignore xdg-decoration and draw double titlebars). Use it in \
-                 [[window_rules]] for specific apps instead. Falling back to \"client\"."
+            collect_warn(
+                errors,
+                "config: default_mode = \"server\" is not supported globally (many toolkits \
+                 ignore xdg-decoration and draw double titlebars). Use it in [[window_rules]] \
+                 for specific apps instead. Falling back to \"client\"."
+                    .to_string(),
             );
             DecorationMode::Client
         }
         Some(other) => {
-            tracing::warn!("Unknown default_mode '{other}', using client");
+            collect_warn(
+                errors,
+                format!("config: unknown default_mode '{other}', using client"),
+            );
             DecorationMode::Client
         }
     };
@@ -103,7 +211,10 @@ pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationCo
         Some("extrabold" | "extra-bold" | "ultrabold") => FontWeight::ExtraBold,
         Some("black" | "heavy") => FontWeight::Black,
         Some(other) => {
-            tracing::warn!("Unknown font_weight '{other}', using medium");
+            collect_warn(
+                errors,
+                format!("config: unknown font_weight '{other}', using medium"),
+            );
             FontWeight::Medium
         }
     };
@@ -112,51 +223,91 @@ pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationCo
         Some("left") => TitleAlign::Left,
         Some("center") | None => TitleAlign::Center,
         Some(other) => {
-            tracing::warn!("Unknown title_align '{other}', using center");
+            collect_warn(
+                errors,
+                format!("config: unknown title_align '{other}', using center"),
+            );
             TitleAlign::Center
         }
     };
 
     DecorationConfig {
-        bg_color: resolve(raw.bg_color, defaults.bg_color, "bg_color"),
-        fg_color: resolve(raw.fg_color, defaults.fg_color, "fg_color"),
-        corner_radius: raw.corner_radius.unwrap_or(defaults.corner_radius).max(0),
+        bg_color: resolve_color(raw.bg_color, defaults.bg_color, "bg_color", errors),
+        fg_color: resolve_color(raw.fg_color, defaults.fg_color, "fg_color", errors),
+        corner_radius: clamp_warn(
+            raw.corner_radius.unwrap_or(defaults.corner_radius),
+            0,
+            i32::MAX,
+            "decorations.corner_radius",
+            errors,
+        ),
         default_mode,
-        border_width: raw.border_width.unwrap_or(defaults.border_width).max(0),
-        border_color: resolve(raw.border_color, defaults.border_color, "border_color"),
-        border_color_focused: resolve(
+        border_width: clamp_warn(
+            raw.border_width.unwrap_or(defaults.border_width),
+            0,
+            i32::MAX,
+            "decorations.border_width",
+            errors,
+        ),
+        border_color: resolve_color(
+            raw.border_color,
+            defaults.border_color,
+            "border_color",
+            errors,
+        ),
+        border_color_focused: resolve_color(
             raw.border_color_focused,
             defaults.border_color_focused,
             "border_color_focused",
+            errors,
         ),
         shadow: raw.shadow.unwrap_or(defaults.shadow),
-        title_bar_height: raw
-            .title_bar_height
-            .unwrap_or(defaults.title_bar_height)
-            .max(1),
+        title_bar_height: clamp_warn(
+            raw.title_bar_height.unwrap_or(defaults.title_bar_height),
+            1,
+            i32::MAX,
+            "decorations.title_bar_height",
+            errors,
+        ),
         font: raw.font.unwrap_or(defaults.font),
-        font_size: raw.font_size.unwrap_or(defaults.font_size).max(1),
+        font_size: clamp_warn(
+            raw.font_size.unwrap_or(defaults.font_size),
+            1,
+            u32::MAX,
+            "decorations.font_size",
+            errors,
+        ),
         font_weight,
         title_align,
     }
 }
 
-fn parse_pattern(s: String) -> Pattern {
+fn parse_pattern(s: String, errors: &mut Warnings) -> Pattern {
     // Strings wrapped in `/…/` are treated as regular expressions.
     // Everything else is a glob pattern (`*` = any sequence of chars).
     if s.len() >= 2 && s.starts_with('/') && s.ends_with('/') {
         let inner = &s[1..s.len() - 1];
         match regex::Regex::new(inner) {
             Ok(re) => return Pattern::Regex(re),
-            Err(e) => tracing::warn!("Invalid regex '/{inner}/': {e}, treating as literal glob"),
+            Err(e) => collect_warn(
+                errors,
+                format!("config: invalid regex '/{inner}/': {e}, treating as literal glob"),
+            ),
         }
     }
     Pattern::Glob(s)
 }
 
-pub(super) fn parse_window_rule(r: WindowRuleFile, mod_key: ModKey) -> Option<WindowRule> {
+pub(super) fn parse_window_rule(
+    r: WindowRuleFile,
+    mod_key: ModKey,
+    errors: &mut Warnings,
+) -> Option<WindowRule> {
     if r.app_id.is_none() && r.title.is_none() {
-        tracing::warn!("Window rule has no match criteria (app_id/title), skipping");
+        collect_warn(
+            errors,
+            "config: window rule has no match criteria (app_id/title), skipping".to_string(),
+        );
         return None;
     }
     // None = "field not set" → window inherits [decorations] default_mode.
@@ -168,7 +319,12 @@ pub(super) fn parse_window_rule(r: WindowRuleFile, mod_key: ModKey) -> Option<Wi
         Some("server") => Some(DecorationMode::Server),
         Some("client") => Some(DecorationMode::Client),
         Some(other) => {
-            tracing::warn!("Unknown decoration mode '{other}', falling through to default_mode");
+            collect_warn(
+                errors,
+                format!(
+                    "config: unknown decoration mode '{other}', falling through to default_mode"
+                ),
+            );
             None
         }
     };
@@ -184,7 +340,10 @@ pub(super) fn parse_window_rule(r: WindowRuleFile, mod_key: ModKey) -> Option<Wi
                         Some(c)
                     }
                     Err(e) => {
-                        tracing::warn!("pass_keys: invalid key combo '{s}': {e}");
+                        collect_warn(
+                            errors,
+                            format!("config: pass_keys invalid key combo '{s}': {e}"),
+                        );
                         None
                     }
                 })
@@ -196,55 +355,75 @@ pub(super) fn parse_window_rule(r: WindowRuleFile, mod_key: ModKey) -> Option<Wi
             }
         }
     };
+    let app_id = r.app_id.map(|s| parse_pattern(s, errors));
+    let title = r.title.map(|s| parse_pattern(s, errors));
+    let size = r.size.and_then(|[w, h]| {
+        if w > 0 && h > 0 {
+            Some((w, h))
+        } else {
+            collect_warn(
+                errors,
+                format!("config: window rule size must be positive, got [{w}, {h}]"),
+            );
+            None
+        }
+    });
+    let opacity = r
+        .opacity
+        .map(|v| clamp_warn(v, 0.0, 1.0, "window rule opacity", errors));
+    let border_width = r
+        .border_width
+        .map(|bw| clamp_warn(bw, 0, i32::MAX, "window rule border_width", errors));
+    let corner_radius = r
+        .corner_radius
+        .map(|cr| clamp_warn(cr, 0, i32::MAX, "window rule corner_radius", errors));
+    let border_color = r.border_color.and_then(|s| {
+        let parsed = parse_color(&s);
+        if parsed.is_none() {
+            collect_warn(
+                errors,
+                format!("config: window rule border_color '{s}' invalid, ignoring"),
+            );
+        }
+        parsed
+    });
+    let border_color_focused = r.border_color_focused.and_then(|s| {
+        let parsed = parse_color(&s);
+        if parsed.is_none() {
+            collect_warn(
+                errors,
+                format!("config: window rule border_color_focused '{s}' invalid, ignoring"),
+            );
+        }
+        parsed
+    });
     Some(WindowRule {
-        app_id: r.app_id.map(parse_pattern),
-        title: r.title.map(parse_pattern),
+        app_id,
+        title,
         position: r.position.map(|[x, y]| (x, y)),
-        size: r.size.and_then(|[w, h]| {
-            if w > 0 && h > 0 {
-                Some((w, h))
-            } else {
-                tracing::warn!("Window rule size must be positive, got [{w}, {h}]");
-                None
-            }
-        }),
+        size,
         widget: r.widget,
         pinned_to_screen: r.pinned_to_screen,
         decoration,
         blur: r.blur.unwrap_or(false),
-        opacity: r.opacity.map(|v| {
-            if !(0.0..=1.0).contains(&v) {
-                tracing::warn!("Window rule opacity {v} out of range, clamping to 0.0–1.0");
-                v.clamp(0.0, 1.0)
-            } else {
-                v
-            }
-        }),
+        opacity,
         pass_keys,
-        border_width: r.border_width.map(|bw| bw.max(0)),
-        border_color: r.border_color.and_then(|s| {
-            let parsed = parse_color(&s);
-            if parsed.is_none() {
-                tracing::warn!("Window rule border_color '{s}' invalid, ignoring");
-            }
-            parsed
-        }),
-        border_color_focused: r.border_color_focused.and_then(|s| {
-            let parsed = parse_color(&s);
-            if parsed.is_none() {
-                tracing::warn!("Window rule border_color_focused '{s}' invalid, ignoring");
-            }
-            parsed
-        }),
-        corner_radius: r.corner_radius.map(|cr| cr.max(0)),
+        border_width,
+        border_color,
+        border_color_focused,
+        corner_radius,
         shadow: r.shadow,
     })
 }
 
-pub(super) fn parse_effects_config(raw: EffectsFileConfig) -> EffectsConfig {
+pub(super) fn parse_effects_config(raw: EffectsFileConfig, errors: &mut Warnings) -> EffectsConfig {
     EffectsConfig {
         blur_radius: raw.blur_radius.unwrap_or(2),
-        blur_strength: raw.blur_strength.unwrap_or(1.1),
+        blur_strength: non_negative(
+            raw.blur_strength.unwrap_or(1.1),
+            "effects.blur_strength",
+            errors,
+        ),
         animate_blur: raw.animate_blur.unwrap_or(false),
     }
 }
@@ -353,6 +532,51 @@ pub(super) fn parse_output_rule(r: OutputRuleFile) -> Result<OutputConfig, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_warn_in_range_is_silent() {
+        let mut errors = Vec::new();
+        assert_eq!(clamp_warn(5, 0, 10, "x", &mut errors), 5);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn clamp_warn_below_min_clamps_and_collects() {
+        let mut errors = Vec::new();
+        assert_eq!(clamp_warn(-3, 0, 10, "x", &mut errors), 0);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn clamp_warn_above_max_clamps_and_collects() {
+        let mut errors = Vec::new();
+        assert_eq!(clamp_warn(99.0, 0.0, 1.0, "x", &mut errors), 1.0);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn non_negative_passes_through_when_positive() {
+        let mut errors = Vec::new();
+        assert_eq!(non_negative(3.5, "x", &mut errors), 3.5);
+        assert_eq!(non_negative(0, "y", &mut errors), 0);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn non_negative_floors_and_collects_when_negative() {
+        let mut errors = Vec::new();
+        assert_eq!(non_negative(-2.0, "x", &mut errors), 0.0);
+        assert_eq!(non_negative(-7, "y", &mut errors), 0);
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn nan_is_treated_as_invalid_not_silently_passed() {
+        let mut errors = Vec::new();
+        assert_eq!(clamp_warn(f64::NAN, 0.0, 1.0, "x", &mut errors), 0.0);
+        assert_eq!(non_negative(f64::NAN, "y", &mut errors), 0.0);
+        assert_eq!(errors.len(), 2);
+    }
 
     #[test]
     fn parse_transform_all_variants() {

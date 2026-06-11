@@ -22,8 +22,9 @@ use smithay::utils::{Logical, Point};
 
 use defaults::{default_bindings, default_gesture_bindings, default_mouse_bindings};
 use parse_helpers::{
-    parse_backend_config, parse_decoration_config, parse_effects_config, parse_output_outline,
-    parse_output_rule, parse_window_rule,
+    Warnings, clamp_warn, collect_warn, non_negative, parse_backend_config,
+    parse_decoration_config, parse_effects_config, parse_output_outline, parse_output_rule,
+    parse_window_rule,
 };
 use toml::{ConfigFile, expand_tilde};
 
@@ -63,7 +64,8 @@ pub struct Config {
     pub edge_pan_cursor: bool,
     /// Cursor edge-pan activation zone, px from the edge.
     pub edge_pan_cursor_zone: f64,
-    /// Base lerp factor for camera animation (frame-rate independent). 0.15 = smooth.
+    /// Base lerp factor for camera animation (frame-rate independent), in (0, 1].
+    /// Lower = smoother; 1 = instant; 0 would freeze the camera.
     pub animation_speed: f64,
     /// On close, pan the camera to the newly focused window (true). When false,
     /// focus only moves to an already-visible window — never off-screen.
@@ -267,15 +269,13 @@ impl Config {
     /// deprecated fields, etc.) alongside the config so callers can surface
     /// them in the on-screen error bar.
     fn from_raw_collect(raw: ConfigFile) -> (Self, Vec<String>) {
-        let mut errors: Vec<String> = Vec::new();
+        let mut errors: Warnings = Vec::new();
 
         /// Collect a validation warning: log it and also push to the errors vec.
         macro_rules! warn_and_collect {
-            ($fmt:literal $(, $arg:expr)* $(,)?) => {{
-                let msg = format!($fmt $(, $arg)*);
-                tracing::warn!("{msg}");
-                errors.push(msg);
-            }};
+            ($fmt:literal $(, $arg:expr)* $(,)?) => {
+                collect_warn(&mut errors, format!($fmt $(, $arg)*))
+            };
         }
 
         let mod_key = match raw.mod_key.as_deref() {
@@ -427,7 +427,13 @@ impl Config {
                 tap_to_click: t.tap_to_click.unwrap_or(true),
                 natural_scroll: t.natural_scroll.unwrap_or(true),
                 tap_and_drag: t.tap_and_drag.unwrap_or(true),
-                accel_speed: t.accel_speed.unwrap_or(0.0).clamp(-1.0, 1.0),
+                accel_speed: clamp_warn(
+                    t.accel_speed.unwrap_or(0.0),
+                    -1.0,
+                    1.0,
+                    "trackpad.accel_speed",
+                    &mut errors,
+                ),
                 accel_profile,
                 click_method: t.click_method.clone(),
                 disable_while_typing: t.disable_while_typing.unwrap_or(true),
@@ -445,16 +451,34 @@ impl Config {
                 }
             };
             MouseDeviceSettings {
-                accel_speed: m.accel_speed.unwrap_or(0.0).clamp(-1.0, 1.0),
+                accel_speed: clamp_warn(
+                    m.accel_speed.unwrap_or(0.0),
+                    -1.0,
+                    1.0,
+                    "mouse.accel_speed",
+                    &mut errors,
+                ),
                 accel_profile,
                 natural_scroll: m.natural_scroll.unwrap_or(false),
             }
         };
 
         let gesture_thresholds = GestureThresholds {
-            swipe_distance: raw.gestures.swipe_threshold.unwrap_or(12.0),
-            pinch_in_scale: raw.gestures.pinch_in_threshold.unwrap_or(0.85),
-            pinch_out_scale: raw.gestures.pinch_out_threshold.unwrap_or(1.15),
+            swipe_distance: non_negative(
+                raw.gestures.swipe_threshold.unwrap_or(12.0),
+                "gestures.swipe_threshold",
+                &mut errors,
+            ),
+            pinch_in_scale: non_negative(
+                raw.gestures.pinch_in_threshold.unwrap_or(0.85),
+                "gestures.pinch_in_threshold",
+                &mut errors,
+            ),
+            pinch_out_scale: non_negative(
+                raw.gestures.pinch_out_threshold.unwrap_or(1.15),
+                "gestures.pinch_out_threshold",
+                &mut errors,
+            ),
         };
 
         let keyboard_layout = {
@@ -467,13 +491,13 @@ impl Config {
             }
         };
 
-        let decorations = parse_decoration_config(raw.decorations);
+        let decorations = parse_decoration_config(raw.decorations, &mut errors);
 
         let window_rules: Vec<WindowRule> = raw
             .window_rules
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|r| parse_window_rule(r, mod_key))
+            .filter_map(|r| parse_window_rule(r, mod_key, &mut errors))
             .collect();
 
         let output_configs = {
@@ -496,12 +520,44 @@ impl Config {
             configs
         };
 
-        let effects = parse_effects_config(raw.effects);
+        let effects = parse_effects_config(raw.effects, &mut errors);
         let backend = parse_backend_config(raw.backend);
 
-        let trackpad_speed = raw.navigation.trackpad_speed.unwrap_or(1.5);
-        let mouse_speed = raw.navigation.mouse_speed.unwrap_or(1.0);
-        let drift = raw.navigation.drift.unwrap_or(0.5);
+        let trackpad_speed = non_negative(
+            raw.navigation.trackpad_speed.unwrap_or(1.5),
+            "navigation.trackpad_speed",
+            &mut errors,
+        );
+        let mouse_speed = non_negative(
+            raw.navigation.mouse_speed.unwrap_or(1.0),
+            "navigation.mouse_speed",
+            &mut errors,
+        );
+        let drift = clamp_warn(
+            raw.navigation.drift.unwrap_or(0.5),
+            0.0,
+            1.0,
+            "navigation.drift",
+            &mut errors,
+        );
+        // Valid range is (0, 1]: at 0 the lerp factor stays 0 and the camera
+        // never reaches its target, so reject it (and negatives/NaN) back to the
+        // default rather than freezing. Above 1 just clamps to instant.
+        let animation_speed = match raw.navigation.animation_speed {
+            Some(v) if v <= 0.0 || v.is_nan() => {
+                warn_and_collect!(
+                    "config: navigation.animation_speed {v} must be in (0, 1] (0 freezes the camera), using 0.3"
+                );
+                0.3
+            }
+            other => clamp_warn(
+                other.unwrap_or(0.3),
+                0.0,
+                1.0,
+                "navigation.animation_speed",
+                &mut errors,
+            ),
+        };
         if raw.navigation.friction.is_some() {
             warn_and_collect!(
                 "config: [navigation] friction was renamed to drift — use 0 (off) to 1 (floatiest), default 0.5"
@@ -528,26 +584,70 @@ impl Config {
             trackpad_speed,
             mouse_speed,
             drift,
-            nudge_step: raw.navigation.nudge_step.unwrap_or(20),
-            pan_step: raw.navigation.pan_step.unwrap_or(100.0),
-            repeat_delay: raw.input.keyboard.repeat_delay.unwrap_or(200),
-            repeat_rate: raw.input.keyboard.repeat_rate.unwrap_or(25),
-            edge_zone: raw.navigation.edge_pan.zone.unwrap_or(100.0),
-            edge_pan_min: raw.navigation.edge_pan.speed_min.unwrap_or(4.0),
-            edge_pan_max: raw.navigation.edge_pan.speed_max.unwrap_or(10.0),
+            nudge_step: non_negative(
+                raw.navigation.nudge_step.unwrap_or(20),
+                "navigation.nudge_step",
+                &mut errors,
+            ),
+            pan_step: non_negative(
+                raw.navigation.pan_step.unwrap_or(100.0),
+                "navigation.pan_step",
+                &mut errors,
+            ),
+            repeat_delay: non_negative(
+                raw.input.keyboard.repeat_delay.unwrap_or(200),
+                "input.keyboard.repeat_delay",
+                &mut errors,
+            ),
+            repeat_rate: non_negative(
+                raw.input.keyboard.repeat_rate.unwrap_or(25),
+                "input.keyboard.repeat_rate",
+                &mut errors,
+            ),
+            edge_zone: non_negative(
+                raw.navigation.edge_pan.zone.unwrap_or(100.0),
+                "navigation.edge_pan.zone",
+                &mut errors,
+            ),
+            edge_pan_min: non_negative(
+                raw.navigation.edge_pan.speed_min.unwrap_or(4.0),
+                "navigation.edge_pan.speed_min",
+                &mut errors,
+            ),
+            edge_pan_max: non_negative(
+                raw.navigation.edge_pan.speed_max.unwrap_or(10.0),
+                "navigation.edge_pan.speed_max",
+                &mut errors,
+            ),
             edge_pan_cursor: raw.navigation.edge_pan.cursor_pan.unwrap_or(false),
-            edge_pan_cursor_zone: raw.navigation.edge_pan.cursor_zone.unwrap_or(20.0),
-            animation_speed: raw.navigation.animation_speed.unwrap_or(0.3),
+            edge_pan_cursor_zone: non_negative(
+                raw.navigation.edge_pan.cursor_zone.unwrap_or(20.0),
+                "navigation.edge_pan.cursor_zone",
+                &mut errors,
+            ),
+            animation_speed,
             auto_navigate_on_close: raw.navigation.auto_navigate_on_close.unwrap_or(true),
             cycle_modifier,
-            zoom_step: raw.zoom.step.unwrap_or(1.1),
-            zoom_fit_padding: raw.zoom.fit_padding.unwrap_or(80.0),
+            zoom_step: non_negative(raw.zoom.step.unwrap_or(1.1), "zoom.step", &mut errors),
+            zoom_fit_padding: non_negative(
+                raw.zoom.fit_padding.unwrap_or(80.0),
+                "zoom.fit_padding",
+                &mut errors,
+            ),
             zoom_reset_on_new_window: raw.zoom.reset_on_new_window.unwrap_or(true),
             zoom_reset_on_activation: raw.zoom.reset_on_activation.unwrap_or(true),
             snap_enabled: raw.snap.enabled.unwrap_or(true),
-            snap_gap: raw.snap.gap.unwrap_or(12.0),
-            snap_distance: raw.snap.distance.unwrap_or(24.0),
-            snap_break_force: raw.snap.break_force.unwrap_or(32.0),
+            snap_gap: non_negative(raw.snap.gap.unwrap_or(12.0), "snap.gap", &mut errors),
+            snap_distance: non_negative(
+                raw.snap.distance.unwrap_or(24.0),
+                "snap.distance",
+                &mut errors,
+            ),
+            snap_break_force: non_negative(
+                raw.snap.break_force.unwrap_or(32.0),
+                "snap.break_force",
+                &mut errors,
+            ),
             snap_same_edge: raw.snap.same_edge.unwrap_or(false),
             snap_edge_center: raw.snap.edge_center.unwrap_or(false),
             background,
@@ -566,8 +666,17 @@ impl Config {
                 .unwrap_or(false),
             cursor_theme: raw.cursor.theme,
             cursor_size: raw.cursor.size,
-            inactive_cursor_opacity: raw.cursor.inactive_opacity.unwrap_or(0.5).clamp(0.0, 1.0),
-            output_outline: parse_output_outline(raw.output.outline.unwrap_or_default()),
+            inactive_cursor_opacity: clamp_warn(
+                raw.cursor.inactive_opacity.unwrap_or(0.5),
+                0.0,
+                1.0,
+                "cursor.inactive_opacity",
+                &mut errors,
+            ),
+            output_outline: parse_output_outline(
+                raw.output.outline.unwrap_or_default(),
+                &mut errors,
+            ),
             nav_anchors: raw
                 .navigation
                 .anchors
@@ -591,6 +700,11 @@ impl Config {
             num_lock: raw.input.keyboard.num_lock.unwrap_or(true),
             caps_lock: raw.input.keyboard.caps_lock.unwrap_or(false),
         };
+        // Stable sort by severity so the error bar's single slot shows the most
+        // actionable warning first (rejected values before auto-clamped ones),
+        // preserving parse order within each severity.
+        errors.sort_by_key(|(severity, _)| *severity);
+        let errors = errors.into_iter().map(|(_, msg)| msg).collect();
         (config, errors)
     }
 
@@ -677,7 +791,7 @@ impl Config {
 
 fn resolve_background_kind(
     raw: toml::BackgroundFileConfig,
-    errors: &mut Vec<String>,
+    errors: &mut Warnings,
 ) -> BackgroundKind {
     let toml::BackgroundFileConfig {
         kind,
@@ -696,16 +810,17 @@ fn resolve_background_kind(
             ("tile", Some(p)) => BackgroundKind::Tile(expand_tilde(&p)),
             ("wallpaper", Some(p)) => BackgroundKind::Wallpaper(expand_tilde(&p)),
             (_, None) => {
-                let msg =
-                    format!("config: [background] type=\"{t}\" requires `path`, using default");
-                tracing::warn!("{msg}");
-                errors.push(msg);
+                collect_warn(
+                    errors,
+                    format!("config: [background] type=\"{t}\" requires `path`, using default"),
+                );
                 BackgroundKind::Default
             }
             (other, _) => {
-                let msg = format!("config: [background] unknown type \"{other}\", using default");
-                tracing::warn!("{msg}");
-                errors.push(msg);
+                collect_warn(
+                    errors,
+                    format!("config: [background] unknown type \"{other}\", using default"),
+                );
                 BackgroundKind::Default
             }
         };
@@ -722,6 +837,51 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejections_sort_before_clamps_for_error_bar() {
+        // accel_speed is parsed before [decorations], so without severity
+        // ordering the auto-clamped value would occupy the bar's first slot.
+        let toml_str = r#"
+            [input.trackpad]
+            accel_speed = 5.0
+
+            [decorations]
+            font_weight = "bogus"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(warnings[0].contains("font_weight"), "got: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("accel_speed")));
+    }
+
+    #[test]
+    fn out_of_range_navigation_values_warn_and_clamp() {
+        let toml_str = r#"
+            [navigation]
+            drift = 5.0
+            trackpad_speed = -2.0
+        "#;
+        let (config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert_eq!(config.drift, 1.0);
+        assert_eq!(config.trackpad_speed, 0.0);
+        assert!(warnings.iter().any(|w| w.contains("navigation.drift")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("navigation.trackpad_speed"))
+        );
+    }
+
+    #[test]
+    fn animation_speed_zero_falls_back_to_default() {
+        let toml_str = r#"
+            [navigation]
+            animation_speed = 0.0
+        "#;
+        let (config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert_eq!(config.animation_speed, 0.3);
+        assert!(warnings.iter().any(|w| w.contains("animation_speed")));
+    }
 
     #[test]
     fn parse_output_rule_negative_scale() {

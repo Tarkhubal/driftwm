@@ -32,6 +32,7 @@ impl DriftWm {
                 }
             };
 
+        self.clear_error(ErrorSource::Keyboard);
         if new_config.keyboard_layout != self.config.keyboard_layout {
             let kb = &new_config.keyboard_layout;
             let xkb = XkbConfig {
@@ -49,6 +50,10 @@ impl DriftWm {
             let num_lock = keyboard.modifier_state().num_lock;
             if let Err(err) = keyboard.set_xkb_config(self, xkb) {
                 tracing::warn!("Config reload: error updating keyboard layout: {err:?}");
+                self.set_error(
+                    ErrorSource::Keyboard,
+                    "keyboard: invalid layout config — keeping previous".to_string(),
+                );
                 new_config.keyboard_layout = self.config.keyboard_layout.clone();
             } else {
                 tracing::info!("Config reload: keyboard layout updated");
@@ -165,8 +170,8 @@ impl DriftWm {
         self.apply_output_rules_after_reload();
         self.recompute_decoration_scale();
 
-        if let Some(first) = config_errors.into_iter().next() {
-            self.set_error(ErrorSource::Config, first);
+        if let Some(msg) = super::errors::summarize_config_errors(&config_errors) {
+            self.set_error(ErrorSource::Config, msg);
         } else {
             self.clear_error(ErrorSource::Config);
         }
