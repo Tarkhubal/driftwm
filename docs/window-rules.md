@@ -88,6 +88,13 @@ differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 | `shadow`               | `bool`                   | inherited | Per-window shadow toggle. Overrides `[decorations] shadow`. Ignored for `decoration = "none"`.                                               |
 | `pass_keys`            | `bool` or `["combo", …]` | `false`   | Forward keys to the app — see below                                                                                                          |
 
+> **Blur has real GPU/VRAM cost.** Results are cached and only recomputed when
+> the content behind a window changes, but the cost does **not** scale down with
+> zoom — a blurred window is processed at full resolution no matter how far you
+> zoom out. Many blurred windows, or a few at extreme zoom-out, can stutter and
+> consume significant VRAM. Prefer enabling `blur` on a handful of windows over
+> applying it globally. There's room to improve this further.
+
 ### `decoration` values
 
 | Value       | Description                                                                                              |
