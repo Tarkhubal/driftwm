@@ -255,6 +255,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
     }
 
+    // Drives the off-screen frame-callback heartbeat when no rendering is
+    // happening (#141); see send_frame_callbacks_fallback.
+    event_loop.handle().insert_source(
+        smithay::reexports::calloop::timer::Timer::from_duration(std::time::Duration::from_secs(1)),
+        |_, _, data: &mut DriftWm| {
+            crate::render::send_frame_callbacks_fallback(data);
+            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
+                std::time::Duration::from_secs(1),
+            )
+        },
+    )?;
+
     // After WAYLAND_DISPLAY is set so satellite can connect as a Wayland client.
     xwayland::setup(&mut data);
 

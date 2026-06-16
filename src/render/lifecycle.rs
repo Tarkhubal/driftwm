@@ -7,6 +7,13 @@ use smithay::output::Output;
 
 use driftwm::canvas;
 
+/// Frame-callback heartbeat for off-screen toplevels: at most one callback per
+/// this interval, vs. full render rate on-screen. Sending zero callbacks
+/// off-screen starves the client's buffer cycle, disconnecting native Wayland
+/// clients (EGL swap starvation) and stalling Xwayland ones (#141). 995ms (not a
+/// round 1s) matches niri so a per-second client still gets one.
+const FRAME_CALLBACK_THROTTLE: Duration = Duration::from_millis(995);
+
 /// Sync foreign-toplevel protocol state with the current window list.
 /// Call once per frame iteration (not per-output).
 pub fn refresh_foreign_toplevels(state: &mut crate::state::DriftWm) {
@@ -43,6 +50,7 @@ impl Default for SurfaceFrameThrottlingState {
 fn frame_callback_filter<'a>(
     output: &'a Output,
     sequence: u32,
+    on_screen: bool,
 ) -> impl FnMut(
     &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     &smithay::wayland::compositor::SurfaceData,
@@ -50,6 +58,12 @@ fn frame_callback_filter<'a>(
 + Copy
 + 'a {
     move |_surface, states| {
+        // Returning None ("not on primary scanout") makes smithay fall through to
+        // its FRAME_CALLBACK_THROTTLE-gated `frame_overdue` path, so off-screen
+        // surfaces get the heartbeat rate instead of the full render rate.
+        if !on_screen {
+            return None;
+        }
         let throttling = states
             .data_map
             .get_or_insert(SurfaceFrameThrottlingState::default);
@@ -203,8 +217,8 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
     let time = state.start_time.elapsed();
     let sequence = crate::state::output_state(output).frame_callback_sequence;
 
-    // Only send frame callbacks to visible windows — off-screen clients
-    // naturally throttle to zero FPS without callbacks.
+    // On-screen windows get callbacks at render rate; off-screen ones get the
+    // FRAME_CALLBACK_THROTTLE heartbeat (see frame_callback_filter).
     let (camera, zoom) = {
         let os = crate::state::output_state(output);
         (os.camera, os.zoom)
@@ -219,15 +233,13 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
         let geom_loc = window.geometry().loc;
         let mut bbox = window.bbox();
         bbox.loc += loc - geom_loc;
-        if !visible_rect.overlaps(bbox) {
-            continue;
-        }
+        let on_screen = visible_rect.overlaps(bbox);
 
         window.send_frame(
             output,
             time,
-            Some(Duration::ZERO),
-            frame_callback_filter(output, sequence),
+            Some(FRAME_CALLBACK_THROTTLE),
+            frame_callback_filter(output, sequence, on_screen),
         );
     }
 
@@ -239,18 +251,27 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
                 output,
                 time,
                 Some(Duration::ZERO),
-                frame_callback_filter(output, sequence),
+                frame_callback_filter(output, sequence, true),
             );
         }
     }
 
-    // Canvas-positioned layer surface frame callbacks
+    // Canvas-positioned widgets pan with the viewport, so throttle them
+    // off-screen like toplevels (unlike the screen-fixed layer surfaces above).
     for cl in &state.canvas_layers {
+        let on_screen = cl.position.is_none_or(|pos| {
+            let sb = cl.surface.bbox();
+            let bbox = smithay::utils::Rectangle::new(
+                (pos.x + sb.loc.x, pos.y + sb.loc.y).into(),
+                sb.size,
+            );
+            visible_rect.overlaps(bbox)
+        });
         cl.surface.send_frame(
             output,
             time,
-            Some(Duration::ZERO),
-            frame_callback_filter(output, sequence),
+            Some(FRAME_CALLBACK_THROTTLE),
+            frame_callback_filter(output, sequence, on_screen),
         );
     }
 
@@ -261,7 +282,7 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
             output,
             time,
             Some(Duration::ZERO),
-            frame_callback_filter(output, sequence),
+            frame_callback_filter(output, sequence, true),
         );
     }
 
@@ -272,7 +293,7 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
             output,
             time,
             Some(Duration::ZERO),
-            frame_callback_filter(output, sequence),
+            frame_callback_filter(output, sequence, true),
         );
     }
 
@@ -282,4 +303,28 @@ pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
     layer_map_for_output(output).cleanup();
 
     state.refresh_idle_inhibit();
+}
+
+/// Idle-safety net for the off-screen heartbeat (#141): `post_render` only runs
+/// when an output renders (damage-driven under udev), so a fully-idle compositor
+/// would never service a mapped-but-off-screen surface. Sharing
+/// FRAME_CALLBACK_THROTTLE with `post_render` dedups: a surface already serviced
+/// within the interval is skipped, so an active render loop produces no doubles.
+/// Covers canvas-positioned surfaces (toplevels and `widget` layer surfaces),
+/// which pan off-viewport; screen-anchored panels and lock surfaces are excluded
+/// — being screen-fixed, they can't be panned away.
+pub fn send_frame_callbacks_fallback(state: &mut crate::state::DriftWm) {
+    let time = state.start_time.elapsed();
+    // Output is irrelevant: the `|_, _| None` filter never reports a primary
+    // scanout, so only the throttle's overdue path can fire.
+    let Some(output) = state.space.outputs().next().cloned() else {
+        return;
+    };
+    for window in state.space.elements() {
+        window.send_frame(&output, time, Some(FRAME_CALLBACK_THROTTLE), |_, _| None);
+    }
+    for cl in &state.canvas_layers {
+        cl.surface
+            .send_frame(&output, time, Some(FRAME_CALLBACK_THROTTLE), |_, _| None);
+    }
 }
