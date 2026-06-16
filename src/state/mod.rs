@@ -854,6 +854,34 @@ impl DriftWm {
             return;
         }
 
+        // Canvas-positioned layer widgets aren't in any LayerMap; resolve them
+        // against each output's visible canvas rect like windows, so a widget
+        // commit redraws only the outputs showing it, not every output.
+        let widget_bbox = self
+            .canvas_layers
+            .iter()
+            .find(|cl| cl.surface.wl_surface() == &root)
+            .and_then(|cl| {
+                let pos = cl.position?;
+                let mut bbox = cl.surface.bbox();
+                bbox.loc += pos;
+                Some(bbox)
+            });
+        if let Some(widget_bbox) = widget_bbox {
+            for output in &outputs {
+                let (cam, zoom) = {
+                    let os = output_state(output);
+                    (os.camera.to_i32_round(), os.zoom)
+                };
+                let viewport = output_logical_size(output);
+                let visible = driftwm::canvas::visible_canvas_rect(cam, viewport, zoom);
+                if visible.overlaps(widget_bbox) {
+                    self.redraws_needed.insert(output.clone());
+                }
+            }
+            return;
+        }
+
         for output in &outputs {
             let hit = layer_map_for_output(output)
                 .layer_for_surface(&root, WindowSurfaceType::ALL)

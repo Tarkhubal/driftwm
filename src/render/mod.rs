@@ -499,7 +499,8 @@ pub(crate) fn compose_capture_elements(
     // Canvas-positioned layer widgets sit between normal windows and widget
     // toplevels, as in compose_frame. Screen-anchored layer surfaces (panels) are
     // excluded — they aren't canvas content.
-    let canvas_layers = build_canvas_layer_elements(state, renderer, output_scale, camera, zoom);
+    let canvas_layers =
+        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom, visible_rect);
     let bg = capture_bg.tile_elements(
         camera,
         viewport_logical,
@@ -1079,7 +1080,7 @@ pub fn compose_frame(
     drop(_windows_span);
 
     let canvas_layer_elements =
-        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom);
+        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom, visible_rect);
 
     let outline_elements =
         build_output_outline_elements(state, renderer, output, camera, zoom, viewport_size);
