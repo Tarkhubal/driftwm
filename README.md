@@ -379,10 +379,11 @@ GLSL shader wallpapers, Python widgets (clock, calendar, system stats, power
 menu), waybar with taskbar/tray, fuzzel window-search script, and window rules
 tying it all together. Use it as a starting point or steal pieces.
 
-## Community tools
+## Community
 
 - [driftwm-settings](https://github.com/wwmaxik/driftwm-settings) — GTK4 GUI config editor
 - [driftwm-noctalia](https://github.com/youssefvdel/driftwm-noctalia) — noctalia shell fork adapted for driftwm
+- [Gallery](https://github.com/malbiruk/driftwm/discussions/143) — community shaders & rices, share your own
 
 ## Contributing
 
