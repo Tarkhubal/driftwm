@@ -438,6 +438,13 @@
                                      # using the KMS cursor plane, while keeping direct
                                      # scanout for fullscreen apps. Fixes a stuttering /
                                      # tearing hardware cursor on discrete NVIDIA GPUs.
+# max_capture_fps = 0                # Cap FPS delivered to continuous screen-capture
+                                     # clients (recorders / casts). 0 = unlimited. Each
+                                     # captured frame forces a full-scene re-composite
+                                     # that competes with a fullscreen app behind it; a
+                                     # cap (e.g. 30 or 60) trims that overhead while
+                                     # gaming + streaming. One-shot screenshots (grim)
+                                     # are never throttled.
 
 [output.outline]
 # color = "#ffffff"           # outline color for other monitors' viewports

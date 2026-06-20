@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::{
@@ -49,6 +50,8 @@ struct SessionData {
     stopped: bool,
     waiting_frame: Option<WaitingFrame>,
     has_captured_once: bool,
+    /// Last promotion time, for `max_capture_fps` rate-limiting.
+    last_frame_time: Option<Duration>,
 }
 
 struct WaitingFrame {
@@ -69,6 +72,15 @@ pub struct ImageCopyCaptureState {
 
 pub struct ImageCopyCaptureGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
+}
+
+/// Rate-limits continuous captures: true when `min_interval` has not elapsed
+/// since `last`. Uncapped or first frame → false.
+fn capture_too_soon(last: Option<Duration>, now: Duration, min_interval: Option<Duration>) -> bool {
+    match (min_interval, last) {
+        (Some(iv), Some(last)) => now.saturating_sub(last) < iv,
+        _ => false,
+    }
 }
 
 impl ImageCopyCaptureState {
@@ -92,8 +104,16 @@ impl ImageCopyCaptureState {
         }
     }
 
-    /// Promote waiting frames to pending captures for an output that has new damage.
-    pub fn promote_waiting_frames(&mut self, output: &Output, pending: &mut Vec<PendingCapture>) {
+    /// Promote waiting frames to pending captures for an output that has new
+    /// damage. A session whose last frame is newer than `min_interval` is skipped;
+    /// its frame stays parked and retries on a later render.
+    pub fn promote_waiting_frames(
+        &mut self,
+        output: &Output,
+        pending: &mut Vec<PendingCapture>,
+        now: Duration,
+        min_interval: Option<Duration>,
+    ) {
         for (_session_obj, session) in &mut self.sessions {
             if session.stopped {
                 continue;
@@ -104,15 +124,20 @@ impl ImageCopyCaptureState {
             if session_output != output {
                 continue;
             }
-            if let Some(waiting) = session.waiting_frame.take() {
-                pending.push(PendingCapture {
-                    frame: waiting.frame,
-                    buffer: waiting.buffer,
-                    kind: PendingCaptureKind::Output(output.clone()),
-                    paint_cursors: session.paint_cursors,
-                    buffer_size: session.buffer_size,
-                });
+            if session.waiting_frame.is_none()
+                || capture_too_soon(session.last_frame_time, now, min_interval)
+            {
+                continue;
             }
+            let waiting = session.waiting_frame.take().unwrap();
+            session.last_frame_time = Some(now);
+            pending.push(PendingCapture {
+                frame: waiting.frame,
+                buffer: waiting.buffer,
+                kind: PendingCaptureKind::Output(output.clone()),
+                paint_cursors: session.paint_cursors,
+                buffer_size: session.buffer_size,
+            });
         }
     }
 
@@ -163,10 +188,16 @@ impl ImageCopyCaptureState {
         });
     }
 
-    /// Promote every waiting toplevel-capture frame to a pending capture.
-    /// Toplevel captures don't have damage tracking yet — we promote on
-    /// every frame the compositor renders.
-    pub fn promote_waiting_toplevel_frames(&mut self, pending: &mut Vec<PendingCapture>) {
+    /// Promote waiting toplevel-capture frames to pending captures. Toplevel
+    /// captures have no damage tracking, so absent a `min_interval` cap they
+    /// promote on every render; `min_interval` rate-limits them, parking a
+    /// too-recent session's frame for a later render.
+    pub fn promote_waiting_toplevel_frames(
+        &mut self,
+        pending: &mut Vec<PendingCapture>,
+        now: Duration,
+        min_interval: Option<Duration>,
+    ) {
         for (_session_obj, session) in &mut self.sessions {
             if session.stopped {
                 continue;
@@ -177,15 +208,20 @@ impl ImageCopyCaptureState {
             if !surface.is_alive() {
                 continue;
             }
-            if let Some(waiting) = session.waiting_frame.take() {
-                pending.push(PendingCapture {
-                    frame: waiting.frame,
-                    buffer: waiting.buffer,
-                    kind: PendingCaptureKind::Toplevel(surface.clone()),
-                    paint_cursors: session.paint_cursors,
-                    buffer_size: session.buffer_size,
-                });
+            if session.waiting_frame.is_none()
+                || capture_too_soon(session.last_frame_time, now, min_interval)
+            {
+                continue;
             }
+            let waiting = session.waiting_frame.take().unwrap();
+            session.last_frame_time = Some(now);
+            pending.push(PendingCapture {
+                frame: waiting.frame,
+                buffer: waiting.buffer,
+                kind: PendingCaptureKind::Toplevel(surface.clone()),
+                paint_cursors: session.paint_cursors,
+                buffer_size: session.buffer_size,
+            });
         }
     }
 
@@ -332,6 +368,7 @@ where
                         stopped,
                         waiting_frame: None,
                         has_captured_once: false,
+                        last_frame_time: None,
                     },
                 ));
             }
@@ -618,4 +655,54 @@ macro_rules! delegate_image_copy_capture {
             smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1: ()
         ] => $crate::protocols::image_copy_capture::ImageCopyCaptureState);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_too_soon;
+    use std::time::Duration;
+
+    #[test]
+    fn uncapped_is_never_too_soon() {
+        assert!(!capture_too_soon(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(1),
+            None
+        ));
+    }
+
+    #[test]
+    fn first_frame_is_never_too_soon() {
+        assert!(!capture_too_soon(
+            None,
+            Duration::from_secs(1),
+            Some(Duration::from_millis(16))
+        ));
+    }
+
+    #[test]
+    fn within_interval_is_too_soon() {
+        let iv = Some(Duration::from_millis(16));
+        assert!(capture_too_soon(
+            Some(Duration::from_millis(100)),
+            Duration::from_millis(110),
+            iv
+        ));
+    }
+
+    #[test]
+    fn at_or_past_interval_is_not_too_soon() {
+        let iv = Some(Duration::from_millis(16));
+        // Exactly at the boundary: elapsed == interval is not < interval.
+        assert!(!capture_too_soon(
+            Some(Duration::from_millis(100)),
+            Duration::from_millis(116),
+            iv
+        ));
+        assert!(!capture_too_soon(
+            Some(Duration::from_millis(100)),
+            Duration::from_millis(200),
+            iv
+        ));
+    }
 }

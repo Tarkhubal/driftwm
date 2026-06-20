@@ -36,6 +36,7 @@ pub(super) struct BackendFileConfig {
     pub wait_for_frame_completion: Option<bool>,
     pub disable_direct_scanout: Option<bool>,
     pub disable_hardware_cursor: Option<bool>,
+    pub max_capture_fps: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]

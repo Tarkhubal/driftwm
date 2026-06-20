@@ -735,6 +735,11 @@ pub struct BackendConfig {
     pub wait_for_frame_completion: bool,
     pub disable_direct_scanout: bool,
     pub disable_hardware_cursor: bool,
+    /// Max frames per second delivered to continuous screen-capture clients
+    /// (screen recorders / casts). 0 = unlimited. Caps the extra full-scene
+    /// re-composite a capture forces, which otherwise rides the compositor's
+    /// render rate and competes with a fullscreen client behind it.
+    pub max_capture_fps: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
