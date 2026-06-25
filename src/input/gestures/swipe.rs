@@ -414,11 +414,11 @@ impl DriftWm {
             return;
         }
         let serial = SERIAL_COUNTER.next_serial();
-        self.space.raise_element(&window, true);
+        self.raise_with_children(&window);
         let Some(surface) = window.wl_surface().map(|s| s.into_owned()) else {
             return;
         };
-        self.set_keyboard_focus(Some(FocusTarget(surface)), serial);
+        self.set_window_focus(Some(FocusTarget(surface)), serial);
         self.enforce_below_windows();
 
         // Screen-pinned windows move in screen space via the same grab as
@@ -471,8 +471,8 @@ impl DriftWm {
         let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) else {
             return;
         };
-        self.space.raise_element(&window, true);
-        self.set_keyboard_focus(Some(FocusTarget(wl_surface.clone())), serial);
+        self.raise_with_children(&window);
+        self.set_window_focus(Some(FocusTarget(wl_surface.clone())), serial);
         self.enforce_below_windows();
 
         // Pinned windows resize in screen space; reuse the pointer resize path,
@@ -588,7 +588,15 @@ impl DriftWm {
             let loc = self.space.element_location(&window).unwrap_or_default();
             return Some((window, loc));
         }
-        self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+        // SSD chrome (title bar / border) lies outside the surface bbox, so
+        // `element_under` misses it; fall back to a decoration hit-test.
+        self.space
+            .element_under(pos)
+            .map(|(w, l)| (w.clone(), l))
+            .or_else(|| {
+                self.decoration_under(pos)
+                    .and_then(|(w, _)| self.space.element_location(&w).map(|l| (w, l)))
+            })
     }
 
     fn forward_swipe_begin(&mut self, fingers: u32, time: u32) {

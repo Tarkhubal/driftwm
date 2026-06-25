@@ -20,6 +20,31 @@ fn parse_modifiers(parts: &[&str], mod_key: ModKey) -> Result<Modifiers, String>
     Ok(mods)
 }
 
+/// True if every `+`-separated token names a modifier — a combo with no keysym,
+/// so it's a tap-modifier binding rather than a `parse_key_combo`. Modifier names
+/// are never valid keysym names, so this never shadows a real key binding.
+fn is_modifier_only(s: &str) -> bool {
+    let mut parts = s.split('+').map(str::trim).peekable();
+    parts.peek().is_some()
+        && parts.all(|p| {
+            matches!(
+                p.to_lowercase().as_str(),
+                "mod" | "alt" | "super" | "logo" | "ctrl" | "control" | "shift"
+            )
+        })
+}
+
+/// Parse a modifier-only combo like "alt+shift" into a `Modifiers` set for a
+/// tap-modifier binding. Returns `None` when `s` is not modifier-only, so the
+/// caller falls back to `parse_key_combo`.
+pub fn parse_tap_combo(s: &str, mod_key: ModKey) -> Option<Result<Modifiers, String>> {
+    if !is_modifier_only(s) {
+        return None;
+    }
+    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
+    Some(parse_modifiers(&parts, mod_key))
+}
+
 /// Parse a key combo string like "Mod+Shift+Up" into a KeyCombo.
 pub fn parse_key_combo(s: &str, mod_key: ModKey) -> Result<KeyCombo, String> {
     let parts: Vec<&str> = s.split('+').map(str::trim).collect();
@@ -83,6 +108,8 @@ pub fn parse_action(s: &str) -> Result<Action, String> {
             let cmd = arg.ok_or("spawn requires a command argument")?;
             Ok(Action::Spawn(cmd.to_string()))
         }
+        "exec-terminal" => Ok(Action::ExecTerminal),
+        "exec-launcher" => Ok(Action::ExecLauncher),
         "close-window" => Ok(Action::CloseWindow),
         "nudge-window" => {
             let dir = parse_direction(arg.ok_or("nudge-window requires a direction")?)?;
@@ -134,6 +161,10 @@ pub fn parse_action(s: &str) -> Result<Action, String> {
         "send-to-output" => {
             let dir = parse_direction(arg.ok_or("send-to-output requires a direction")?)?;
             Ok(Action::SendToOutput(dir))
+        }
+        "send-cursor-to-output" => {
+            let dir = parse_direction(arg.ok_or("send-cursor-to-output requires a direction")?)?;
+            Ok(Action::SendCursorToOutput(dir))
         }
         "switch-layout" => {
             let arg = arg.ok_or("switch-layout requires next, prev, or a layout index")?;
@@ -275,6 +306,8 @@ fn parse_threshold_action(s: &str) -> Result<Option<ThresholdAction>, String> {
     match s {
         "center-nearest" => Ok(Some(ThresholdAction::CenterNearest)),
         "center-window"
+        | "exec-terminal"
+        | "exec-launcher"
         | "focus-center"
         | "home-toggle"
         | "zoom-to-fit"
@@ -296,6 +329,7 @@ fn parse_threshold_action(s: &str) -> Result<Option<ThresholdAction>, String> {
         s if s.starts_with("exec ")
             || s.starts_with("spawn ")
             || s.starts_with("send-to-output ")
+            || s.starts_with("send-cursor-to-output ")
             || s.starts_with("switch-layout ") =>
         {
             let action = parse_action(s)?;

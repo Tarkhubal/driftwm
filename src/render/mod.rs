@@ -25,8 +25,8 @@ pub use elements::{
 };
 pub use error_bar::ErrorBarCache;
 pub use lifecycle::{
-    post_render, refresh_foreign_toplevels, take_presentation_feedback,
-    update_primary_scanout_output,
+    post_render, refresh_foreign_toplevels, send_frame_callbacks_fallback,
+    take_presentation_feedback, update_primary_scanout_output,
 };
 // TODO(multi-gpu): drop the allow once the render path consumes these.
 #[allow(unused_imports)]
@@ -503,7 +503,8 @@ pub(crate) fn compose_capture_elements(
     // Canvas-positioned layer widgets sit between normal windows and widget
     // toplevels, as in compose_frame. Screen-anchored layer surfaces (panels) are
     // excluded — they aren't canvas content.
-    let canvas_layers = build_canvas_layer_elements(state, renderer, output_scale, camera, zoom);
+    let canvas_layers =
+        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom, visible_rect);
     let bg = capture_bg.tile_elements(
         camera,
         viewport_logical,
@@ -538,6 +539,11 @@ pub fn compose_frame(
 
     let name = output.name();
     let output_fullscreen = state.is_output_fullscreen(output);
+    // The fullscreen window fully occludes its output: only it, the overlay
+    // layer, and the cursor render; everything beneath is culled below. Pinned
+    // windows count as top-tier toplevels and get covered like the top layer.
+    let fullscreen_window = state.fullscreen.get(output).map(|fs| fs.window.clone());
+    let mut did_init_bg = false;
     if output_fullscreen {
         // Fullscreen fully occludes the canvas: free its chunk caches and skip
         // the background. Maximize is NOT fullscreen, so it keeps its background.
@@ -548,6 +554,7 @@ pub fn compose_frame(
     {
         let output_size = crate::state::output_logical_size(output);
         init_background(state, renderer, output_size, &name);
+        did_init_bg = true;
     }
 
     // Read per-output state directly — active_output() follows the pointer,
@@ -556,6 +563,22 @@ pub fn compose_frame(
         let os = crate::state::output_state(output);
         (os.camera, os.zoom)
     };
+
+    // A just-re-created `cached_bg` carries placeholder camera=(0,0)/zoom=1.0
+    // (see `init_background`), so without this it renders one frame at the wrong
+    // offset. NaN "last" values force the uniform push (same sentinel as
+    // `OutputState`'s initial values). No-op for the chunk caches, which derive
+    // geometry from the live camera each frame.
+    if did_init_bg {
+        update_background_element(
+            state,
+            output,
+            camera,
+            zoom,
+            Point::from((f64::NAN, f64::NAN)),
+            f64::NAN,
+        );
+    }
 
     let viewport_size = crate::state::output_logical_size(output);
     let visible_rect = canvas::visible_canvas_rect(camera.to_i32_round(), viewport_size, zoom);
@@ -589,6 +612,9 @@ pub fn compose_frame(
         let Some(loc) = state.space.element_location(window) else {
             continue;
         };
+        if output_fullscreen && fullscreen_window.as_ref() != Some(window) {
+            continue;
+        }
         let geom_loc = window.geometry().loc;
         let geom_size = window.geometry().size;
         let Some(wl_surface) = window.wl_surface() else {
@@ -1082,11 +1108,18 @@ pub fn compose_frame(
     #[cfg(feature = "profile-with-tracy")]
     drop(_windows_span);
 
-    let canvas_layer_elements =
-        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom);
+    // Both sit below the windows, so the fullscreen window fully occludes them.
+    let canvas_layer_elements = if output_fullscreen {
+        Vec::new()
+    } else {
+        build_canvas_layer_elements(state, renderer, output_scale, camera, zoom, visible_rect)
+    };
 
-    let outline_elements =
-        build_output_outline_elements(state, renderer, output, camera, zoom, viewport_size);
+    let outline_elements = if output_fullscreen {
+        Vec::new()
+    } else {
+        build_output_outline_elements(state, renderer, output, camera, zoom, viewport_size)
+    };
 
     let bg_elements: Vec<OutputRenderElements> = if output_fullscreen {
         vec![]
@@ -1133,8 +1166,11 @@ pub fn compose_frame(
     } else {
         (vec![], vec![])
     };
-    let (background_layer_elements, _) =
-        build_layer_elements(state, output, renderer, WlrLayer::Background, None);
+    let (background_layer_elements, _) = if !is_fullscreen {
+        build_layer_elements(state, output, renderer, WlrLayer::Background, None)
+    } else {
+        (vec![], vec![])
+    };
     #[cfg(feature = "profile-with-tracy")]
     drop(_layers_span);
 

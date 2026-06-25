@@ -243,31 +243,38 @@ pub fn init_winit(
                     age = 0;
                 }
             }
-            let render_ok = match backend.bind() {
+            let submit_damage = match backend.bind() {
                 Ok((renderer, mut framebuffer)) => {
                     let all_elements =
                         crate::render::compose_frame(data, renderer, &output, cursor_elements);
-                    let result = damage_tracker.render_output(
+                    let damage = match damage_tracker.render_output(
                         renderer,
                         &mut framebuffer,
                         age,
                         &all_elements,
                         [0.0f32, 0.0, 0.0, 1.0],
-                    );
-                    if let Err(err) = result {
-                        tracing::warn!("Render error: {err:?}");
-                    }
+                    ) {
+                        Ok(res) => res.damage.cloned(),
+                        Err(err) => {
+                            tracing::warn!("Render error: {err:?}");
+                            None
+                        }
+                    };
                     crate::render::render_screencopy(data, renderer, &output, &all_elements);
                     crate::render::render_capture_frames(data, renderer, &output, &all_elements);
                     crate::render::render_toplevel_captures(data, renderer);
-                    true
+                    damage
                 }
                 Err(err) => {
                     tracing::warn!("Backend bind error: {err:?}");
-                    false
+                    None
                 }
             };
-            if render_ok && let Err(err) = backend.submit(None) {
+            // `None` skips the buffer swap so the host compositor isn't forced
+            // to recomposite at 60fps while nothing on screen moves.
+            if let Some(damage) = submit_damage
+                && let Err(err) = backend.submit(Some(&damage))
+            {
                 tracing::warn!("Submit error: {err:?}");
             }
 
@@ -282,16 +289,11 @@ pub fn init_winit(
             // --- Put backend back ---
             data.backend = Some(Backend::Winit(backend));
 
-            // --- Bump frame-callback sequence so surfaces can receive a
-            // fresh callback this render tick (winit has no real VBlank). ---
-            {
-                let mut os = crate::state::output_state(&output);
-                os.frame_callback_sequence = os.frame_callback_sequence.wrapping_add(1);
-            }
-
             // --- Post-render ---
             crate::render::refresh_foreign_toplevels(data);
             crate::render::post_render(data, &output);
+            data.render
+                .evict_idle_capture_state(data.start_time.elapsed());
             data.display_handle.flush_clients().ok();
 
             #[cfg(feature = "profile-with-tracy")]

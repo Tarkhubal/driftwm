@@ -121,7 +121,7 @@ not stuck to the screen. This gives spatial awareness when panning.
 Four modes:
 
 - **`shader`** — procedural GLSL, animated or static, optionally sampling an image via `texture`. Default is a dot grid. See [docs/shaders.md](docs/shaders.md) to write your own. Bundled shaders live in `extras/wallpapers/{static,animated,textured}/`.
-- **`tile`** — PNG/JPG (single texture, tiled infinitely), or a tiled pyramidal TIFF for [gigapixel wallpapers](docs/gigapixel-wallpapers.md).
+- **`tile`** — PNG/JPG (single texture, tiled infinitely), or a tiled pyramidal TIFF for [gigapixel wallpapers](docs/gigapixel-wallpapers.md). Set `mirror_tile = true` to mirror-fold a non-seamless image so it tiles without seams (kaleidoscope look).
 - **`wallpaper`** — single image stretched to fill viewport (does not scroll/zoom) — a classic desktop wallpaper.
 - **`none`** — no built-in background, so an external `wlr-layer-shell` wallpaper daemon (`swaybg`, `swww`, `mpvpaper` for live video) becomes the wallpaper instead.
 
@@ -235,17 +235,61 @@ cargo build
 cargo run
 ```
 
-To add driftwm as a session in your NixOS config:
+To enable `driftwm` on NixOS, you can import and use the provided NixOS module in your configuration.
+
+Using Flakes:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    driftwm.url = "github:malbiruk/driftwm";
+  };
+
+  outputs = { self, nixpkgs, driftwm, ... }: {
+    nixosConfigurations.myHost = nixpkgs.lib.nixosSystem {
+      modules = [
+        driftwm.nixosModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+Then, enable it in your configuration:
+
+```nix
+# configuration.nix
+{
+  programs.driftwm.enable = true;
+}
+```
+
+Alternatively, without flakes (by importing the flake's output directly):
 
 ```nix
 let
   driftwm-flake = builtins.getFlake "github:malbiruk/driftwm";
-  driftwm = driftwm-flake.packages.x86_64-linux.default;
 in
 {
-  services.displayManager.sessionPackages = [ driftwm ];
-  environment.systemPackages = [ driftwm ];
+  imports = [ driftwm-flake.nixosModules.default ];
+  programs.driftwm.enable = true;
 }
+```
+
+#### NixOS Module Options
+
+The NixOS module provides the following options under `programs.driftwm`:
+
+- `enable`: Whether to enable `driftwm` (defaults to `false`).
+- `package`: The package containing the `driftwm` compositor binary.
+
+By default, the module enables XWayland support via `xwayland-satellite` by defaulting `programs.xwayland.enable` to `true`. If you want to disable or explicitly enable it, configure:
+
+```nix
+programs.xwayland.enable = true; # or false to disable XWayland and xwayland-satellite
 ```
 
 ### Build from source
@@ -352,9 +396,10 @@ Validate without starting: `driftwm --check-config`.
 autostart = ["waybar", "swaync", "swayosd-server"]
 ```
 
-See [`config.reference.toml`](config.reference.toml) for all options: input
-settings, scroll/momentum tuning, snap behavior, decorations, effects,
-per-output config, gesture bindings, mouse bindings, and window rules.
+Every option is documented in **[docs/config.md](docs/config.md)** (generated
+from [`config.reference.toml`](config.reference.toml)): input settings,
+scroll/momentum tuning, snap behavior, decorations, effects, per-output config,
+gesture bindings, mouse bindings, and window rules.
 
 ## Example setup
 
@@ -379,10 +424,12 @@ GLSL shader wallpapers, Python widgets (clock, calendar, system stats, power
 menu), waybar with taskbar/tray, fuzzel window-search script, and window rules
 tying it all together. Use it as a starting point or steal pieces.
 
-## Community tools
+## Community
 
 - [driftwm-settings](https://github.com/wwmaxik/driftwm-settings) — GTK4 GUI config editor
 - [driftwm-noctalia](https://github.com/youssefvdel/driftwm-noctalia) — noctalia shell fork adapted for driftwm
+- [Just Enough Shell](https://github.com/ORFLEM/just_enough_shell) — minimal QuickShell desktop shell, driftwm-focused
+- [Gallery](https://github.com/malbiruk/driftwm/discussions/143) — community shaders & rices, share your own
 
 ## Contributing
 

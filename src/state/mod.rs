@@ -74,6 +74,7 @@ use smithay::reexports::drm::control::crtc;
 
 use crate::backend::Backend;
 use crate::input::gestures::GestureState;
+use crate::input::keyboard::TapTracker;
 use driftwm::canvas::MomentumState;
 use driftwm::config::Config;
 use driftwm::window_ext::WindowExt;
@@ -103,6 +104,13 @@ pub struct CaptureOutputState {
     pub age: usize,
     /// Reset age when cursor inclusion changes between frames.
     pub last_paint_cursors: bool,
+    /// Time (since `start_time`) this state was last rendered into; idle
+    /// entries are evicted so a finished capture's texture doesn't linger
+    /// until output disconnect.
+    pub last_used: std::time::Duration,
+    /// Last frame time submitted to a continuous capture client, for
+    /// `max_capture_fps` rate-limiting.
+    pub last_submit: Option<std::time::Duration>,
 }
 
 /// Buffered middle-click from a 3-finger tap. Held for DOUBLE_TAP_WINDOW_MS
@@ -235,10 +243,6 @@ pub struct OutputState {
     /// from config for multi-monitor.
     pub layout_position: Point<i32, Logical>,
     pub home_return: Option<HomeReturn>,
-    /// Bumped per VBlank (or render tick on winit). Gates frame_callback
-    /// emission to one-per-cycle per surface so vsync-ignoring clients
-    /// (Wine games) can't pin the main thread.
-    pub frame_callback_sequence: u32,
 }
 
 pub fn init_output_state(
@@ -268,7 +272,6 @@ pub fn init_output_state(
             last_frame_instant: Instant::now(),
             layout_position,
             home_return: None,
-            frame_callback_sequence: 0,
         })
     });
 }
@@ -477,7 +480,20 @@ pub struct DriftWm {
     pub focus_history: Vec<Window>,
     pub cycle_state: Option<usize>,
 
+    /// Window-level keyboard-focus intent. The actual keyboard focus is
+    /// derived from this plus any higher-priority owner (session lock,
+    /// exclusive / on-demand layer surface) in `update_keyboard_focus`.
+    pub window_focus: Option<FocusTarget>,
+    /// Layer surface granted keyboard focus on click via `OnDemand`
+    /// interactivity. Cleared when a window takes focus or it unmaps.
+    pub on_demand_layer: Option<WlSurface>,
+
     pub held_action: Option<(u32, driftwm::config::Action, Instant)>,
+
+    pub tap: TapTracker,
+    /// Action queued by a completed tap chord, run after the closure forwards
+    /// the modifier events so the focused client still sees them.
+    pub pending_tap_action: Option<driftwm::config::Action>,
 
     /// Keycodes whose press was intercepted by a binding. Their releases must
     /// also be intercepted, otherwise the focused client receives a "release
@@ -626,19 +642,23 @@ impl DriftWm {
             self.space.raise_element(&w, false);
         }
 
-        // Raise children after parents so nested hierarchies stack correctly.
-        let parented: Vec<Window> = self
-            .space
-            .elements()
-            .filter(|w| w.parent_surface().is_some())
-            .cloned()
-            .collect();
-        for child in parented {
-            self.space.raise_element(&child, false);
-        }
-
         for fs in self.fullscreen.values() {
             self.space.raise_element(&fs.window, false);
+        }
+    }
+
+    /// Raise `window`, then its child windows, so a child/modal dialog stays
+    /// directly above its own parent without jumping over unrelated windows
+    /// that sit higher in the stack.
+    pub fn raise_with_children(&mut self, window: &Window) {
+        let stack: Vec<Window> = self.space.elements().cloned().collect();
+        let order = subtree_raise_order(&stack, window, |child, parent| {
+            parent
+                .wl_surface()
+                .is_some_and(|s| child.parent_surface().as_ref() == Some(&*s))
+        });
+        for w in &order {
+            self.space.raise_element(w, true);
         }
     }
 
@@ -711,7 +731,7 @@ impl DriftWm {
 
     /// Raise a window and focus it (or its innermost modal child).
     pub fn raise_and_focus(&mut self, window: &Window, serial: smithay::utils::Serial) {
-        self.space.raise_element(window, true);
+        self.raise_with_children(window);
         self.enforce_below_windows();
 
         let focus_surface = self
@@ -719,7 +739,160 @@ impl DriftWm {
             .or(Some(window.clone()))
             .and_then(|w| w.wl_surface().map(|s| FocusTarget(s.into_owned())));
 
-        self.set_keyboard_focus(focus_surface, serial);
+        self.set_window_focus(focus_surface, serial);
+    }
+
+    /// Record a window-level keyboard-focus intent and recompute the actual
+    /// focus. Higher-priority owners (an exclusive / on-demand layer surface)
+    /// still win — this is what keeps a launcher focused while the pointer
+    /// moves over a window underneath it.
+    pub fn set_window_focus(
+        &mut self,
+        target: Option<FocusTarget>,
+        serial: smithay::utils::Serial,
+    ) {
+        self.window_focus = target;
+        // An explicit window focus supersedes any on-demand layer focus.
+        self.on_demand_layer = None;
+        self.update_keyboard_focus(serial);
+    }
+
+    /// Derive and apply the authoritative keyboard focus from the current
+    /// state, in priority order: session lock (handled imperatively, so we
+    /// bail) → exclusive layer → on-demand layer → focused window.
+    pub fn update_keyboard_focus(&mut self, serial: smithay::utils::Serial) {
+        if !matches!(self.session_lock, SessionLock::Unlocked) {
+            return;
+        }
+        // A popup keyboard grab owns focus; don't fight it.
+        if self.seat.get_keyboard().unwrap().is_grabbed() {
+            return;
+        }
+
+        let target = self
+            .exclusive_layer_focus()
+            .or_else(|| self.on_demand_layer_focus())
+            .or_else(|| self.focused_window_target());
+        self.set_keyboard_focus(target, serial);
+    }
+
+    /// The window the keyboard falls back to when no layer owns focus. Prefers
+    /// the live `window_focus` intent; if that window died while a layer or
+    /// lock held focus, recovers via the most-recent live history entry rather
+    /// than focusing nothing. A deliberate `None` (e.g. click on empty canvas)
+    /// stays `None`.
+    fn focused_window_target(&self) -> Option<FocusTarget> {
+        use smithay::utils::IsAlive;
+        match &self.window_focus {
+            Some(t) if t.0.alive() => Some(t.clone()),
+            Some(_) => self
+                .focus_history
+                .iter()
+                .find(|w| w.alive())
+                .and_then(|w| w.wl_surface().map(|s| FocusTarget(s.into_owned()))),
+            None => None,
+        }
+    }
+
+    /// First mapped layer surface (across outputs and canvas layers) that
+    /// requests `Exclusive` keyboard interactivity, in z-priority order.
+    fn exclusive_layer_focus(&self) -> Option<FocusTarget> {
+        use smithay::utils::IsAlive;
+        use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+
+        for cl in &self.canvas_layers {
+            let s = cl.surface.wl_surface();
+            if s.alive()
+                && cl.surface.cached_state().keyboard_interactivity
+                    == KeyboardInteractivity::Exclusive
+            {
+                return Some(FocusTarget(s.clone()));
+            }
+        }
+        for output in self.space.outputs() {
+            let map = smithay::desktop::layer_map_for_output(output);
+            for layer in [Layer::Overlay, Layer::Top, Layer::Bottom, Layer::Background] {
+                for surface in map.layers_on(layer) {
+                    let s = surface.wl_surface();
+                    if s.alive()
+                        && surface.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
+                    {
+                        return Some(FocusTarget(s.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The tracked on-demand layer surface, if it's still mapped and still
+    /// requests `OnDemand` interactivity.
+    fn on_demand_layer_focus(&self) -> Option<FocusTarget> {
+        use smithay::utils::IsAlive;
+        use smithay::wayland::shell::wlr_layer::KeyboardInteractivity;
+
+        let surface = self.on_demand_layer.as_ref()?;
+        if !surface.alive() {
+            return None;
+        }
+        (self.layer_interactivity(surface) == Some(KeyboardInteractivity::OnDemand))
+            .then(|| FocusTarget(surface.clone()))
+    }
+
+    fn layer_interactivity(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<smithay::wayland::shell::wlr_layer::KeyboardInteractivity> {
+        for cl in &self.canvas_layers {
+            if cl.surface.wl_surface() == surface {
+                return Some(cl.surface.cached_state().keyboard_interactivity);
+            }
+        }
+        for output in self.space.outputs() {
+            let map = smithay::desktop::layer_map_for_output(output);
+            for l in map.layers() {
+                if l.wl_surface() == surface {
+                    return Some(l.cached_state().keyboard_interactivity);
+                }
+            }
+        }
+        None
+    }
+
+    /// On a click over a layer surface, grant it keyboard focus if it requests
+    /// `OnDemand`. A click elsewhere (passed `None` or a non-on-demand layer)
+    /// clears any existing on-demand focus.
+    pub fn focus_layer_if_on_demand(
+        &mut self,
+        surface: Option<WlSurface>,
+        serial: smithay::utils::Serial,
+    ) {
+        use smithay::wayland::compositor::get_parent;
+        use smithay::wayland::shell::wlr_layer::KeyboardInteractivity;
+
+        // The pointer's focus may be a subsurface; resolve to the root surface
+        // that the layer is keyed by.
+        let surface = surface.map(|mut s| {
+            while let Some(parent) = get_parent(&s) {
+                s = parent;
+            }
+            s
+        });
+
+        if let Some(surface) = surface
+            && self.layer_interactivity(&surface) == Some(KeyboardInteractivity::OnDemand)
+        {
+            if self.on_demand_layer.as_ref() != Some(&surface) {
+                self.on_demand_layer = Some(surface);
+                self.update_keyboard_focus(serial);
+            }
+            return;
+        }
+
+        if self.on_demand_layer.take().is_some() {
+            self.update_keyboard_focus(serial);
+        }
     }
 
     /// Single point where keyboard focus is applied.
@@ -842,6 +1015,34 @@ impl DriftWm {
                 let viewport = output_logical_size(output);
                 let visible = driftwm::canvas::visible_canvas_rect(cam, viewport, zoom);
                 if visible.overlaps(chrome_bbox) {
+                    self.redraws_needed.insert(output.clone());
+                }
+            }
+            return;
+        }
+
+        // Canvas-positioned layer widgets aren't in any LayerMap; resolve them
+        // against each output's visible canvas rect like windows, so a widget
+        // commit redraws only the outputs showing it, not every output.
+        let widget_bbox = self
+            .canvas_layers
+            .iter()
+            .find(|cl| cl.surface.wl_surface() == &root)
+            .and_then(|cl| {
+                let pos = cl.position?;
+                let mut bbox = cl.surface.bbox();
+                bbox.loc += pos;
+                Some(bbox)
+            });
+        if let Some(widget_bbox) = widget_bbox {
+            for output in &outputs {
+                let (cam, zoom) = {
+                    let os = output_state(output);
+                    (os.camera.to_i32_round(), os.zoom)
+                };
+                let viewport = output_logical_size(output);
+                let visible = driftwm::canvas::visible_canvas_rect(cam, viewport, zoom);
+                if visible.overlaps(widget_bbox) {
                     self.redraws_needed.insert(output.clone());
                 }
             }
@@ -1601,6 +1802,29 @@ impl DriftWm {
     }
 }
 
+/// Order in which to raise `target` and its descendants so each child ends up
+/// directly above its own parent: `target` first, then descendants breadth-first,
+/// leaving unrelated windows below the subtree untouched. `is_child(a, b)` reports
+/// whether `a`'s parent is `b`. Already-visited windows are skipped, so cyclic
+/// parent links still terminate.
+fn subtree_raise_order<T>(stack: &[T], target: &T, is_child: impl Fn(&T, &T) -> bool) -> Vec<T>
+where
+    T: Clone + PartialEq,
+{
+    let mut order = vec![target.clone()];
+    let mut i = 0;
+    while i < order.len() {
+        let parent = order[i].clone();
+        for w in stack {
+            if !order.contains(w) && is_child(w, &parent) {
+                order.push(w.clone());
+            }
+        }
+        i += 1;
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,8 +1851,47 @@ mod tests {
             last_frame_instant: Instant::now(),
             layout_position: Point::from(layout_position),
             home_return: None,
-            frame_callback_sequence: 0,
         }
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    struct StackWin {
+        id: u32,
+        parent: Option<u32>,
+    }
+
+    fn win(id: u32, parent: Option<u32>) -> StackWin {
+        StackWin { id, parent }
+    }
+
+    fn raise(stack: &[StackWin], target: u32) -> Vec<u32> {
+        let target = stack.iter().find(|w| w.id == target).unwrap();
+        subtree_raise_order(stack, target, |c, p| c.parent == Some(p.id))
+            .iter()
+            .map(|w| w.id)
+            .collect()
+    }
+
+    #[test]
+    fn raise_lifts_only_own_children() {
+        // 0 has child 1; 2 is unrelated.
+        let stack = [win(0, None), win(1, Some(0)), win(2, None)];
+        assert_eq!(raise(&stack, 0), vec![0, 1]);
+        assert_eq!(raise(&stack, 2), vec![2]);
+    }
+
+    #[test]
+    fn raise_follows_nested_modal_chain() {
+        // 0 -> 1 -> 2 (dialog of a dialog), plus unrelated 3.
+        let stack = [win(0, None), win(1, Some(0)), win(2, Some(1)), win(3, None)];
+        assert_eq!(raise(&stack, 0), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn raise_terminates_on_cyclic_parents() {
+        // 0 and 1 claim each other as parent; must not loop forever.
+        let stack = [win(0, Some(1)), win(1, Some(0))];
+        assert_eq!(raise(&stack, 0), vec![0, 1]);
     }
 
     #[test]

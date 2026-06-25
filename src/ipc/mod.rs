@@ -217,7 +217,7 @@ fn cmd_layout(short: bool, state: &mut DriftWm) -> Reply {
 /// The stored config always matches the loaded keymap (init pins it on the
 /// invalid-config fallback, reload swaps both together), so the index resolves;
 /// the display-name fallback only guards a malformed token (e.g. a trailing comma).
-fn active_layout_short(state: &mut DriftWm) -> String {
+pub(crate) fn active_layout_short(state: &mut DriftWm) -> String {
     let Some(keyboard) = state.seat.get_keyboard() else {
         return state.active_layout.clone();
     };

@@ -1,6 +1,6 @@
 [package]
 name = "driftwm"
-version = "0.11.0"
+version = "0.12.1"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
@@ -35,6 +35,7 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
+inotify = { version = "0.11", default-features = false }
 calloop = { version = "0.14", features = ["signals"] }
 drm-ffi = "0.9"
 bytemuck = { version = "1.25", features = ["derive"] }

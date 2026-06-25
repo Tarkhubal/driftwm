@@ -8,6 +8,7 @@ mod types;
 pub use parse::{
     parse_action, parse_direction, parse_gesture_binding, parse_gesture_config_entry,
     parse_gesture_trigger, parse_key_combo, parse_mouse_action, parse_mouse_binding,
+    parse_tap_combo,
 };
 pub use toml::config_path;
 pub use types::*;
@@ -38,6 +39,7 @@ const TOOLKIT_DEFAULTS: &[(&str, &str)] = &[
     ("ELECTRON_OZONE_PLATFORM_HINT", "wayland"),
 ];
 
+#[derive(Debug, PartialEq)]
 pub struct Config {
     pub mod_key: ModKey,
     pub focus_follows_mouse: bool,
@@ -70,8 +72,9 @@ pub struct Config {
     /// On close, pan the camera to the newly focused window (true). When false,
     /// focus only moves to an already-visible window — never off-screen.
     pub auto_navigate_on_close: bool,
-    /// Modifier held during window cycling. Release commits selection.
-    pub cycle_modifier: CycleModifier,
+    /// Modifiers held during Alt-Tab window cycling, derived from the
+    /// `cycle-windows forward` binding. Releasing them commits the selection.
+    pub cycle_hold: Modifiers,
     /// Zoom step multiplier per keypress. 1.1 = 10% per press.
     pub zoom_step: f64,
     /// Padding (viewport/screen pixels) around the bounding box for ZoomToFit.
@@ -87,8 +90,8 @@ pub struct Config {
     pub snap_gap: f64,
     pub snap_distance: f64,
     pub snap_break_force: f64,
-    pub snap_same_edge: bool,
-    pub snap_edge_center: bool,
+    pub snap_corners: bool,
+    pub snap_centers: bool,
     pub background: BackgroundConfig,
     pub trackpad: TrackpadSettings,
     pub mouse_device: MouseDeviceSettings,
@@ -118,7 +121,16 @@ pub struct Config {
     pub child_env: HashMap<String, String>,
     pub output_configs: Vec<OutputConfig>,
     bindings: HashMap<KeyCombo, Action>,
+    /// Tap-modifier bindings: a bare modifier chord (e.g. `alt+shift`) that
+    /// fires its action when the chord is pressed and released with no other
+    /// key on top. Keyed by the exact modifier set.
+    tap_bindings: HashMap<Modifiers, Action>,
     pub mouse: ContextBindings<MouseBinding, MouseAction>,
+    /// When `true` (default), dragging a window's edge or corner resizes it
+    /// via the invisible resize border (SSD frame or CSD margin). When `false`,
+    /// that border is inert — resize only through explicit bindings (e.g.
+    /// `alt+RMB`) or gestures.
+    pub resize_on_border: bool,
     /// When `true`, resizing a window by dragging its edge (SSD or CSD
     /// border) propagates to every window connected to it via snap
     /// adjacency. Keybinding and gesture resize are unaffected — bind
@@ -143,6 +155,11 @@ impl Config {
         };
         combo.normalize();
         self.bindings.get(&combo)
+    }
+
+    /// Look up a tap-modifier binding by the completed chord's modifier set.
+    pub fn tap_lookup(&self, mods: &Modifiers) -> Option<&Action> {
+        self.tap_bindings.get(mods)
     }
 
     /// Look up a mouse button action by modifier state, button code, and context.
@@ -287,15 +304,6 @@ impl Config {
             }
         };
 
-        let cycle_modifier = match raw.cycle_modifier.as_deref() {
-            Some("ctrl") => CycleModifier::Ctrl,
-            Some("alt") | None => CycleModifier::Alt,
-            Some(other) => {
-                warn_and_collect!("config: unknown cycle_modifier '{other}', using alt");
-                CycleModifier::Alt
-            }
-        };
-
         let window_placement = match raw.window_placement.as_deref() {
             Some("cursor") => WindowPlacement::Cursor,
             Some("auto") => WindowPlacement::Auto,
@@ -306,7 +314,7 @@ impl Config {
             }
         };
 
-        let mut bindings: HashMap<KeyCombo, Action> = default_bindings(mod_key, cycle_modifier)
+        let mut bindings: HashMap<KeyCombo, Action> = default_bindings(mod_key)
             .into_iter()
             .map(|(mut k, v)| {
                 k.normalize();
@@ -314,8 +322,30 @@ impl Config {
             })
             .collect();
 
+        let mut tap_bindings: HashMap<Modifiers, Action> = HashMap::new();
         if let Some(user_bindings) = raw.keybindings {
             for (key_str, action_str) in &user_bindings {
+                // A bare modifier chord (no keysym) is a tap-modifier binding.
+                if let Some(tap_result) = parse::parse_tap_combo(key_str, mod_key) {
+                    match tap_result {
+                        Ok(mods) => {
+                            if action_str == "none" {
+                                tap_bindings.remove(&mods);
+                            } else {
+                                match parse_action(action_str) {
+                                    Ok(action) => {
+                                        tap_bindings.insert(mods, action);
+                                    }
+                                    Err(e) => warn_and_collect!(
+                                        "config: invalid action '{action_str}': {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => warn_and_collect!("config: invalid tap binding '{key_str}': {e}"),
+                    }
+                    continue;
+                }
                 match parse_key_combo(key_str, mod_key) {
                     Ok(mut combo) => {
                         combo.normalize();
@@ -337,6 +367,21 @@ impl Config {
             }
         }
 
+        // The cycle "hold" modifier — released to commit an Alt-Tab cycle — is
+        // whatever `cycle-windows forward` is bound to, so rebinding the cycle
+        // key moves the hold modifier with it. Reading the forward binding (not
+        // backward) keeps the backward binding's extra shift out of the set.
+        let cycle_hold = bindings
+            .iter()
+            .find(|(_, action)| matches!(action, Action::CycleWindows { backward: false }))
+            .map(|(combo, _)| combo.modifiers.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or(Modifiers {
+                alt: true,
+                ..Modifiers::EMPTY
+            });
+
+        let resize_on_border = raw.mouse.resize_on_border.unwrap_or(true);
         let decoration_resize_snapped = raw.mouse.decoration_resize_snapped.unwrap_or(false);
         let decoration_fit_snapped = raw.mouse.decoration_fit_snapped.unwrap_or(false);
         let mut mouse_bindings = default_mouse_bindings(mod_key);
@@ -406,6 +451,7 @@ impl Config {
         }
 
         let background = BackgroundConfig {
+            mirror_tile: raw.background.mirror_tile.unwrap_or(false),
             cache_shader: raw.background.cache_shader.unwrap_or(false),
             transparent_shader: raw.background.transparent_shader.unwrap_or(false),
             cache_budget_mb: raw.background.cache_budget_mb.unwrap_or(128),
@@ -436,7 +482,8 @@ impl Config {
                     &mut errors,
                 ),
                 accel_profile,
-                click_method: t.click_method.clone(),
+                // `"none"` means "use the libinput device default", same as unset.
+                click_method: t.click_method.clone().filter(|m| m.as_str() != "none"),
                 disable_while_typing: t.disable_while_typing.unwrap_or(true),
             }
         };
@@ -491,6 +538,22 @@ impl Config {
                 model: k.model.clone().unwrap_or_default(),
             }
         };
+
+        // A group-switch xkb option bound to a modifier pair (alt+shift,
+        // ctrl+shift) rewrites the second key into a layout switch, so that
+        // exact chord never registers — a tap binding on it would silently
+        // never fire. Flag it instead of letting the user debug the silence.
+        for mods in tap_bindings.keys() {
+            if let Some(opt) = tap_option_conflict(mods, &keyboard_layout.options) {
+                warn_and_collect!(
+                    "config: tap binding '{}' will never fire while [input.keyboard] options has \
+                     {} (it consumes those modifiers for layout switching) — remove the option \
+                     and use this tap binding for layout switching instead",
+                    tap_combo_label(mods),
+                    opt,
+                );
+            }
+        }
 
         let decorations = parse_decoration_config(raw.decorations, &mut errors);
 
@@ -564,15 +627,27 @@ impl Config {
                 "config: [navigation] friction was renamed to drift — use 0 (off) to 1 (floatiest), default 0.5"
             );
         }
+        if raw.snap.same_edge.is_some() {
+            warn_and_collect!("config: [snap] same_edge was renamed to corners");
+        }
+        if raw.snap.edge_center.is_some() {
+            warn_and_collect!("config: [snap] edge_center was renamed to centers");
+        }
+
+        // `"none"` (theme) and `0` (size) are explicit "inherit from the
+        // environment" sentinels — normalize them to unset so a config that
+        // spells out the default still round-trips to omitting the field.
+        let cursor_theme = raw.cursor.theme.filter(|t| t.as_str() != "none");
+        let cursor_size = raw.cursor.size.filter(|s| *s != 0);
 
         let mut child_env: HashMap<String, String> = TOOLKIT_DEFAULTS
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        if let Some(theme) = &raw.cursor.theme {
+        if let Some(theme) = &cursor_theme {
             child_env.insert("XCURSOR_THEME".into(), theme.clone());
         }
-        if let Some(size) = raw.cursor.size {
+        if let Some(size) = cursor_size {
             child_env.insert("XCURSOR_SIZE".into(), size.to_string());
         }
         for (k, v) in &raw.env {
@@ -628,7 +703,7 @@ impl Config {
             ),
             animation_speed,
             auto_navigate_on_close: raw.navigation.auto_navigate_on_close.unwrap_or(true),
-            cycle_modifier,
+            cycle_hold,
             zoom_step: non_negative(raw.zoom.step.unwrap_or(1.1), "zoom.step", &mut errors),
             zoom_fit_padding: non_negative(
                 raw.zoom.fit_padding.unwrap_or(80.0),
@@ -649,8 +724,8 @@ impl Config {
                 "snap.break_force",
                 &mut errors,
             ),
-            snap_same_edge: raw.snap.same_edge.unwrap_or(false),
-            snap_edge_center: raw.snap.edge_center.unwrap_or(false),
+            snap_corners: raw.snap.corners.unwrap_or(false),
+            snap_centers: raw.snap.centers.unwrap_or(false),
             background,
             decorations,
             effects,
@@ -665,8 +740,8 @@ impl Config {
                 .keyboard
                 .remember_layout_per_window
                 .unwrap_or(false),
-            cursor_theme: raw.cursor.theme,
-            cursor_size: raw.cursor.size,
+            cursor_theme,
+            cursor_size,
             inactive_cursor_opacity: clamp_warn(
                 raw.cursor.inactive_opacity.unwrap_or(0.5),
                 0.0,
@@ -694,7 +769,9 @@ impl Config {
             window_placement,
             output_configs,
             bindings,
+            tap_bindings,
             mouse: mouse_bindings,
+            resize_on_border,
             decoration_resize_snapped,
             decoration_fit_snapped,
             gestures: gesture_bindings,
@@ -790,6 +867,39 @@ impl Config {
     }
 }
 
+/// Render a modifier set as a binding string (e.g. `alt+shift`) for messages.
+fn tap_combo_label(m: &Modifiers) -> String {
+    let mut parts = Vec::new();
+    if m.ctrl {
+        parts.push("ctrl");
+    }
+    if m.alt {
+        parts.push("alt");
+    }
+    if m.shift {
+        parts.push("shift");
+    }
+    if m.logo {
+        parts.push("super");
+    }
+    parts.join("+")
+}
+
+/// If a tap chord would be made unreachable by an xkb group-switch option in
+/// `options` (comma-separated), return the offending option token. Only
+/// modifier-*pair* toggles conflict: they turn the second modifier into a group
+/// switch, so the pair never forms a held chord. Single-key toggles
+/// (`grp:caps_toggle`, etc.) consume no modifier and so never conflict.
+fn tap_option_conflict<'a>(mods: &Modifiers, options: &'a str) -> Option<&'a str> {
+    options.split(',').map(str::trim).find(|opt| {
+        (mods.alt && mods.shift && opt.contains("alt") && opt.contains("shift"))
+            || (mods.ctrl
+                && mods.shift
+                && (opt.contains("ctrl") || opt.contains("control"))
+                && opt.contains("shift"))
+    })
+}
+
 fn resolve_background_kind(
     raw: toml::BackgroundFileConfig,
     errors: &mut Warnings,
@@ -798,6 +908,7 @@ fn resolve_background_kind(
         kind,
         path,
         texture,
+        mirror_tile: _,
         cache_shader: _,
         transparent_shader: _,
         cache_budget_mb: _,
@@ -811,6 +922,7 @@ fn resolve_background_kind(
             },
             ("tile", Some(p)) => BackgroundKind::Tile(expand_tilde(&p)),
             ("wallpaper", Some(p)) => BackgroundKind::Wallpaper(expand_tilde(&p)),
+            ("default", _) => BackgroundKind::Default,
             // `path` is inapplicable here and silently ignored — like `texture`
             // on the tile/wallpaper types. Not worth a persistent error-bar
             // warning, since the background renders exactly as asked (nothing).
@@ -843,6 +955,102 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1 of the reference-config contract (#2/#3 live in
+    /// `tests/config_reference_test.rs`): every config field the code defines is
+    /// documented in `config.reference.toml`. Serializing a defaulted
+    /// `ConfigFile` to JSON honors serde renames (`type`, `on-window`), and each
+    /// leaf's full dotted path (`cursor.theme`, `input.keyboard.repeat_rate`) is
+    /// matched under its section, so a field documented under the wrong section
+    /// is still caught.
+    ///
+    /// Not covered: the inner fields of `[[window_rules]]` / `[[outputs]]` —
+    /// those are documented in prose (`field — description`), not `key =` lines,
+    /// so there is nothing to match a dotted path against.
+    #[test]
+    fn every_config_field_is_documented() {
+        use std::collections::BTreeSet;
+
+        const REFERENCE: &str = include_str!("../../config.reference.toml");
+        // Deprecated, migration-only — intentionally undocumented.
+        const ALLOWLIST: &[&str] = &["navigation.friction", "snap.same_edge", "snap.edge_center"];
+
+        // Each `[a.b]` header is itself a documented path and sets the section
+        // for the `key = …` lines under it (→ `a.b.key`).
+        fn documented_paths(reference: &str) -> BTreeSet<String> {
+            let mut paths = BTreeSet::new();
+            let mut section = String::new();
+            for raw in reference.lines() {
+                let line = raw.trim_start();
+                let line = line.strip_prefix("# ").unwrap_or(line);
+                let line = line.strip_prefix("# ").unwrap_or(line).trim();
+                // A real header is a bracketed token with nothing trailing, so
+                // prose that merely opens with `[` isn't mistaken for a section
+                // (mirrors the single-token key guard below).
+                if line.starts_with('[') && line.ends_with(']') {
+                    section = line
+                        .trim_matches(|c: char| c == '[' || c == ']')
+                        .trim()
+                        .to_string();
+                    paths.insert(section.clone());
+                } else if let Some((key, _)) = line.split_once('=') {
+                    // A real config key is a single token; skip illustrative prose
+                    // with `=` (shell `export FOO=1`, GLSL `vec2 c = ...`).
+                    let key = key.trim().trim_matches('"');
+                    if !key.is_empty() && !key.contains(char::is_whitespace) {
+                        paths.insert(if section.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{section}.{key}")
+                        });
+                    }
+                }
+            }
+            paths
+        }
+
+        // Dotted path of every leaf; an empty object counts as a leaf, not a
+        // section to recurse into.
+        fn collect_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+            if let serde_json::Value::Object(map) = value {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    match child {
+                        serde_json::Value::Object(inner) if !inner.is_empty() => {
+                            collect_paths(child, &path, out)
+                        }
+                        _ => {
+                            out.insert(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // The one Option<table> that defaults to None — populate it so its
+        // fields are walked individually, not hidden behind a null.
+        let mut raw = ConfigFile::default();
+        raw.output.outline = Some(Default::default());
+        let default_json = serde_json::to_value(&raw).expect("ConfigFile should serialize");
+        let mut code_paths = BTreeSet::new();
+        collect_paths(&default_json, "", &mut code_paths);
+
+        let documented = documented_paths(REFERENCE);
+        let undocumented: Vec<&str> = code_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !documented.contains(*p) && !ALLOWLIST.contains(p))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "config fields defined in code but undocumented in config.reference.toml: {undocumented:?}"
+        );
+    }
 
     #[test]
     fn rejections_sort_before_clamps_for_error_bar() {
@@ -999,5 +1207,87 @@ mod tests {
     fn remember_layout_per_window_omitted_in_toml_defaults_false() {
         let config = Config::from_toml("").unwrap();
         assert!(!config.remember_layout_per_window);
+    }
+
+    #[test]
+    fn modifier_only_keybinding_parses_as_tap() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+        "#;
+        let config = Config::from_toml(toml_str).unwrap();
+        let mods = Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::EMPTY
+        };
+        assert!(matches!(
+            config.tap_lookup(&mods),
+            Some(Action::SwitchLayout(LayoutSwitch::Next))
+        ));
+    }
+
+    #[test]
+    fn normal_keybinding_is_not_a_tap() {
+        let toml_str = r#"
+            [keybindings]
+            "mod+q" = "close-window"
+        "#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert!(config.tap_bindings.is_empty());
+    }
+
+    #[test]
+    fn tap_binding_conflicting_with_xkb_option_warns() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:alt_shift_toggle"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("grp:alt_shift_toggle") && w.contains("tap binding")),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn tap_binding_conflict_warns_for_side_specific_toggle() {
+        // grp:lalt_lshift_toggle still consumes alt+shift — the warning names the
+        // actual option token, not a hard-coded one.
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:lalt_lshift_toggle,compose:ralt"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("grp:lalt_lshift_toggle")),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn tap_binding_with_nonconflicting_xkb_option_does_not_warn() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:caps_toggle"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("tap binding")),
+            "got: {warnings:?}"
+        );
     }
 }

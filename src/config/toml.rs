@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ConfigFile {
     pub mod_key: Option<String>,
-    pub cycle_modifier: Option<String>,
     pub focus_follows_mouse: Option<bool>,
     pub input: InputConfig,
     pub cursor: CursorConfig,
@@ -30,15 +29,16 @@ pub(super) struct ConfigFile {
     pub outputs: Option<Vec<OutputRuleFile>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct BackendFileConfig {
     pub wait_for_frame_completion: Option<bool>,
     pub disable_direct_scanout: Option<bool>,
     pub disable_hardware_cursor: Option<bool>,
+    pub max_capture_fps: Option<u32>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct EffectsFileConfig {
     pub blur_radius: Option<u32>,
@@ -46,7 +46,7 @@ pub(super) struct EffectsFileConfig {
     pub animate_blur: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct InputConfig {
     pub keyboard: KeyboardConfig,
@@ -54,7 +54,7 @@ pub(super) struct InputConfig {
     pub mouse: MouseDeviceFileConfig,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct TrackpadConfig {
     pub tap_to_click: Option<bool>,
@@ -66,7 +66,7 @@ pub(super) struct TrackpadConfig {
     pub disable_while_typing: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct MouseDeviceFileConfig {
     pub accel_speed: Option<f64>,
@@ -74,7 +74,7 @@ pub(super) struct MouseDeviceFileConfig {
     pub natural_scroll: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct KeyboardConfig {
     pub repeat_rate: Option<i32>,
@@ -89,7 +89,7 @@ pub(super) struct KeyboardConfig {
     pub remember_layout_per_window: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct CursorConfig {
     pub theme: Option<String>,
@@ -97,7 +97,7 @@ pub(super) struct CursorConfig {
     pub inactive_opacity: Option<f64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct NavigationConfig {
     pub animation_speed: Option<f64>,
@@ -114,7 +114,7 @@ pub(super) struct NavigationConfig {
     pub edge_pan: EdgePanConfig,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct EdgePanConfig {
     pub zone: Option<f64>,
@@ -128,7 +128,7 @@ pub(super) struct EdgePanConfig {
     pub cursor_zone: Option<f64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ZoomConfig {
     pub step: Option<f64>,
@@ -137,24 +137,30 @@ pub(super) struct ZoomConfig {
     pub reset_on_activation: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct SnapConfig {
     pub enabled: Option<bool>,
     pub gap: Option<f64>,
     pub distance: Option<f64>,
     pub break_force: Option<f64>,
+    pub corners: Option<bool>,
+    pub centers: Option<bool>,
+    /// Renamed to `corners`; kept only so a stale value yields a migration
+    /// warning instead of failing the whole parse via `deny_unknown_fields`.
     pub same_edge: Option<bool>,
+    /// Renamed to `centers`; kept only so a stale value yields a migration
+    /// warning instead of failing the whole parse via `deny_unknown_fields`.
     pub edge_center: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct OutputConfig {
     pub outline: Option<OutputOutlineConfig>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct OutputOutlineConfig {
     pub color: Option<String>,
@@ -162,7 +168,7 @@ pub(super) struct OutputOutlineConfig {
     pub opacity: Option<f64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct BackgroundFileConfig {
     #[serde(rename = "type")]
@@ -170,12 +176,14 @@ pub(super) struct BackgroundFileConfig {
     pub path: Option<String>,
     /// Optional image sampled by a `type = "shader"` background via `tex`.
     pub texture: Option<String>,
+    /// Mirror-fold a `type = "tile"` image so non-seamless edges tile cleanly.
+    pub mirror_tile: Option<bool>,
     pub cache_shader: Option<bool>,
     pub transparent_shader: Option<bool>,
     pub cache_budget_mb: Option<u32>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct DecorationFileConfig {
     pub bg_color: Option<String>,
@@ -200,14 +208,14 @@ pub(super) struct DecorationFileConfig {
 /// pass_keys = true                        # forward ALL keys
 /// pass_keys = ["mod+q", "ctrl+q"]         # forward only these combos
 /// ```
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub(super) enum PassKeysFile {
     Bool(bool),
     Keys(Vec<String>),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WindowRuleFile {
     pub app_id: Option<String>,
@@ -235,9 +243,12 @@ pub(super) struct WindowRuleFile {
     pub shadow: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct MouseFileConfig {
+    /// Enable dragging a window's edge/corner to resize it.
+    /// See [`super::Config::resize_on_border`].
+    pub resize_on_border: Option<bool>,
     /// Propagate edge-drag resize to snapped neighbors.
     /// See [`super::Config::decoration_resize_snapped`].
     pub decoration_resize_snapped: Option<bool>,
@@ -251,7 +262,7 @@ pub(super) struct MouseFileConfig {
     pub anywhere: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct GestureFileConfig {
     pub swipe_threshold: Option<f64>,
@@ -264,7 +275,7 @@ pub(super) struct GestureFileConfig {
     pub anywhere: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OutputRuleFile {
     pub name: String,
@@ -274,7 +285,7 @@ pub(super) struct OutputRuleFile {
     pub mode: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct XwaylandConfig {
     pub enabled: bool,

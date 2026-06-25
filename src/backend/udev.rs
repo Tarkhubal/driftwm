@@ -16,7 +16,7 @@ use smithay::{
             compositor::{DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
         },
-        egl::{EGLContext, EGLDevice, EGLDisplay},
+        egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             ImportDma,
@@ -195,6 +195,12 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
         return;
     }
 
+    // Free capture textures left by finished screenshot/screencast clients
+    // (kept warm while one renders into them). Only fires on render-active
+    // cycles, so a fully-idle stop frees on next activity — memory, not battery.
+    data.render
+        .evict_idle_capture_state(data.start_time.elapsed());
+
     let Some(device) = data.udev_device.clone() else {
         return;
     };
@@ -269,14 +275,23 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
         }
     }
 
-    // Global animations (key repeat, cursor, animated bg) → every output.
+    // Global animations (key repeat, cursor) → every output.
     if data.held_action.is_some()
         || data.cursor.exec_cursor_show_at.is_some()
         || data.cursor.exec_cursor_deadline.is_some()
         || data.cursor_is_animated()
-        || data.render.background_is_animated
     {
         data.mark_all_dirty();
+    } else if data.render.background_is_animated {
+        // Fullscreen outputs skip the background entirely, so an animated bg
+        // gives them nothing to redraw — marking them just burns battery.
+        let dirty: Vec<_> = data
+            .active_outputs
+            .iter()
+            .filter(|o| !data.is_output_fullscreen(o))
+            .cloned()
+            .collect();
+        data.redraws_needed.extend(dirty);
     }
 
     // 4. Foreign toplevel refresh (once per frame, not per-output)
@@ -420,13 +435,19 @@ pub fn init_udev(
                     continue;
                 }
             };
-            let egl_context = match EGLContext::new(&egl_display) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("{}: failed to create EGL context ({e})", path.display());
-                    continue;
-                }
-            };
+            // High priority lets the compositor's composite preempt a
+            // GPU-saturating client (shader compile, screen-share encode) instead
+            // of queuing behind it. EGL_IMG_context_priority is best-effort:
+            // smithay falls back to default priority if the extension is absent, and
+            // some drivers (notably NVIDIA) may only partially honor it.
+            let egl_context =
+                match EGLContext::new_with_priority(&egl_display, ContextPriority::High) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("{}: failed to create EGL context ({e})", path.display());
+                        continue;
+                    }
+                };
             let render_formats: Vec<Format> = egl_context
                 .dmabuf_render_formats()
                 .iter()
@@ -644,8 +665,6 @@ pub fn init_udev(
                         Err(e) => tracing::warn!("frame_submitted error: {e:?}"),
                     }
                     data.frames_pending.remove(&crtc);
-                    // The sequence was already bumped at queue_frame time so the
-                    // just-presented commit's frame callback fires this cycle.
                     // Real VBlank beat any estimated-VBlank timer we might have armed.
                     if let Some(token) = data.estimated_vblank_timers.remove(&crtc) {
                         data.loop_handle.remove(token);
@@ -678,6 +697,7 @@ pub fn init_udev(
                     // when the session is paused.
                     data.suppressed_keys.clear();
                     data.cycle_state = None;
+                    data.tap.reset();
                 }
                 SessionEvent::ActivateSession => {
                     tracing::info!("Session resumed (VT switch back)");
@@ -1303,6 +1323,33 @@ fn teardown_output(data: &mut DriftWm, surface: SurfaceData, is_last: bool) {
     data.screencopy_state.remove_output(&output);
     data.gamma_control_manager_state.output_removed(&output);
 
+    // Fail + drop pending captures that can no longer render — a stranded entry
+    // hangs the client and leaks its buffer fd. Toplevel captures drain on any
+    // output's render path, but when this was the *last* output no CRTC remains
+    // to run them (the virtual placeholder is never rendered), so they're dead.
+    // Screencopy's Drop sends failed() itself; ext-image-copy frames must be
+    // failed explicitly.
+    data.pending_screencopies.retain(|s| s.output() != &output);
+    {
+        use driftwm::protocols::image_copy_capture::PendingCaptureKind;
+        use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::ext_image_copy_capture_frame_v1::FailureReason;
+        let mut i = 0;
+        while i < data.pending_captures.len() {
+            let dead = match &data.pending_captures[i].kind {
+                PendingCaptureKind::Output(o) => o == &output,
+                PendingCaptureKind::Toplevel(_) => is_last,
+            };
+            if dead {
+                data.pending_captures
+                    .swap_remove(i)
+                    .frame
+                    .failed(FailureReason::Unknown);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Disable the wl_output global before any further state mutation so clients
     // (wf-recorder, swayosd, etc.) see the removal first.
     remove_output_global(data, global);
@@ -1521,13 +1568,6 @@ fn render_frame(
             match queue_result {
                 Ok(()) => {
                     data.frames_pending.insert(crtc);
-                    // Bump the frame-callback sequence here, before post_render
-                    // emits frame callbacks. If we waited for the VBlank handler
-                    // the just-rendered commit's filter would still see the old
-                    // sequence and suppress its callback — clients halve their
-                    // FPS while waiting one vblank longer than necessary.
-                    let mut os = crate::state::output_state(output);
-                    os.frame_callback_sequence = os.frame_callback_sequence.wrapping_add(1);
                 }
                 Err(FrameError::EmptyFrame) => {
                     // No page flip - no real VBlank to wake us. Always arm the
@@ -1646,15 +1686,10 @@ fn queue_estimated_vblank_timer(data: &mut DriftWm, output: &Output, crtc: crtc:
         .unwrap_or_else(|| Duration::from_micros(16_667));
 
     let timer = Timer::from_duration(duration);
-    let output_for_timer = output.clone();
     match data
         .loop_handle
         .insert_source(timer, move |_, _, data: &mut DriftWm| {
             data.estimated_vblank_timers.remove(&crtc);
-            // No real VBlank arrived in time; advance the throttle sequence so
-            // surfaces can receive a fresh frame_callback on the next render.
-            let mut os = crate::state::output_state(&output_for_timer);
-            os.frame_callback_sequence = os.frame_callback_sequence.wrapping_add(1);
             TimeoutAction::Drop
         }) {
         Ok(tok) => {

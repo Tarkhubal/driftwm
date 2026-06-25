@@ -370,9 +370,9 @@ where
             return;
         }
 
-        let buffer = match request {
-            zwlr_screencopy_frame_v1::Request::Copy { buffer } => buffer,
-            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => buffer,
+        let (buffer, with_damage) = match request {
+            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
+            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
             _ => unreachable!(),
         };
 
@@ -418,6 +418,7 @@ where
             frame: frame.clone(),
             info: info.clone(),
             submitted: false,
+            with_damage,
         });
 
         // Remove from pending_frames now that copy was requested
@@ -466,6 +467,7 @@ pub struct Screencopy {
     frame: ZwlrScreencopyFrameV1,
     buffer: ScreencopyBuffer,
     submitted: bool,
+    with_damage: bool,
 }
 
 impl Drop for Screencopy {
@@ -491,6 +493,12 @@ impl Screencopy {
 
     pub fn overlay_cursor(&self) -> bool {
         self.info.overlay_cursor
+    }
+
+    /// True for `copy_with_damage`: the client only wants a frame once the
+    /// output actually changes, so wait for real damage instead of forcing one.
+    pub fn with_damage(&self) -> bool {
+        self.with_damage
     }
 
     pub fn submit(mut self, y_invert: bool, timestamp: Duration) {

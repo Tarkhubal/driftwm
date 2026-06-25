@@ -15,8 +15,10 @@ fn get_capture_state<'a>(
     scale: Scale<f64>,
     transform: Transform,
     paint_cursors: bool,
+    now: std::time::Duration,
 ) -> &'a mut crate::state::CaptureOutputState {
-    map.entry(key.to_owned())
+    let cs = map
+        .entry(key.to_owned())
         .or_insert_with(|| crate::state::CaptureOutputState {
             damage_tracker: smithay::backend::renderer::damage::OutputDamageTracker::new(
                 size, scale, transform,
@@ -24,7 +26,31 @@ fn get_capture_state<'a>(
             offscreen_texture: None,
             age: 0,
             last_paint_cursors: paint_cursors,
-        })
+            last_used: now,
+            last_submit: None,
+        });
+    cs.last_used = now;
+    cs
+}
+
+/// Minimum interval between capture frames for a `max_capture_fps` setting
+/// (0 = unlimited → `None`).
+fn capture_min_interval(max_fps: u32) -> Option<std::time::Duration> {
+    (max_fps > 0).then(|| std::time::Duration::from_secs_f64(1.0 / max_fps as f64))
+}
+
+/// Record a successful screencopy submit time for `max_capture_fps` throttling.
+/// Per-output (shared across all wlr-screencopy clients on the output), so a
+/// concurrent one-shot grab can briefly throttle a recorder — acceptable.
+fn stamp_capture_submit(
+    map: &mut std::collections::HashMap<String, crate::state::CaptureOutputState>,
+    key: &str,
+    use_persistent: bool,
+    now: std::time::Duration,
+) {
+    if use_persistent && let Some(cs) = map.get_mut(key) {
+        cs.last_submit = Some(now);
+    }
 }
 
 /// Fulfill pending screencopy requests by rendering to offscreen textures.
@@ -39,11 +65,29 @@ pub fn render_screencopy(
     use smithay::wayland::shm;
     use std::ptr;
 
-    // Extract only requests for this output, keep the rest
+    let timestamp = state.start_time.elapsed();
+    let min_interval = capture_min_interval(state.config.backend.max_capture_fps);
+    let capture_key = format!("sc:{}", output.name());
+
+    // Only copy_with_damage captures are rate-limited by max_capture_fps; a
+    // too-soon frame stays queued and retries on a later render. Plain one-shot
+    // copy (e.g. grim) is never throttled.
+    let throttle_with_damage = min_interval.is_some_and(|iv| {
+        state
+            .render
+            .capture_state
+            .get(&capture_key)
+            .and_then(|cs| cs.last_submit)
+            .is_some_and(|last| timestamp.saturating_sub(last) < iv)
+    });
+
+    // Extract requests for this output; rate-limited copy_with_damage frames
+    // stay queued.
     let mut pending = Vec::new();
     let mut i = 0;
     while i < state.pending_screencopies.len() {
-        if state.pending_screencopies[i].output() == output {
+        let sc = &state.pending_screencopies[i];
+        if sc.output() == output && !(throttle_with_damage && sc.with_damage()) {
             pending.push(state.pending_screencopies.swap_remove(i));
         } else {
             i += 1;
@@ -58,8 +102,6 @@ pub fn render_screencopy(
     let scale = Scale::from(output_scale);
     let transform = output.current_transform();
     let output_mode_size = output.current_mode().unwrap().size;
-    let timestamp = state.start_time.elapsed();
-    let capture_key = format!("sc:{}", output.name());
 
     for screencopy in pending {
         let size = screencopy.buffer_size();
@@ -101,6 +143,7 @@ pub fn render_screencopy(
                         scale,
                         transform,
                         paint_cursors,
+                        timestamp,
                     ))
                 } else {
                     None
@@ -119,6 +162,12 @@ pub fn render_screencopy(
                             tracing::warn!("screencopy: dmabuf sync wait failed: {e:?}");
                             continue; // screencopy Drop sends failed()
                         }
+                        stamp_capture_submit(
+                            &mut state.render.capture_state,
+                            &capture_key,
+                            use_persistent,
+                            timestamp,
+                        );
                         screencopy.submit(false, timestamp);
                     }
                     Err(e) => {
@@ -135,6 +184,7 @@ pub fn render_screencopy(
                         scale,
                         transform,
                         paint_cursors,
+                        timestamp,
                     ))
                 } else {
                     None
@@ -172,6 +222,12 @@ pub fn render_screencopy(
 
                         match copy_ok {
                             Ok(true) => {
+                                stamp_capture_submit(
+                                    &mut state.render.capture_state,
+                                    &capture_key,
+                                    use_persistent,
+                                    timestamp,
+                                );
                                 screencopy.submit(false, timestamp);
                             }
                             _ => {
@@ -349,10 +405,16 @@ pub fn render_capture_frames(
     use smithay::wayland::shm;
     use std::ptr;
 
-    // Promote any sessions waiting for damage on this output
-    state
-        .image_copy_capture_state
-        .promote_waiting_frames(output, &mut state.pending_captures);
+    let timestamp = state.start_time.elapsed();
+    let min_interval = capture_min_interval(state.config.backend.max_capture_fps);
+
+    // Promote sessions waiting for damage on this output (max_capture_fps gated).
+    state.image_copy_capture_state.promote_waiting_frames(
+        output,
+        &mut state.pending_captures,
+        timestamp,
+        min_interval,
+    );
 
     // Extract captures for this output (toplevel captures are routed
     // separately by `render_toplevel_captures`).
@@ -378,7 +440,6 @@ pub fn render_capture_frames(
     let scale = Scale::from(output_scale);
     let output_transform = output.current_transform();
     let output_mode_size = output_transform.transform_size(output.current_mode().unwrap().size);
-    let timestamp = state.start_time.elapsed();
     let capture_key = format!("cap:{}", output.name());
 
     let fail_reason = smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::ext_image_copy_capture_frame_v1::FailureReason::Unknown;
@@ -422,6 +483,7 @@ pub fn render_capture_frames(
                     scale,
                     Transform::Normal,
                     paint_cursors,
+                    timestamp,
                 ))
             } else {
                 None
@@ -457,6 +519,7 @@ pub fn render_capture_frames(
                     scale,
                     Transform::Normal,
                     paint_cursors,
+                    timestamp,
                 ))
             } else {
                 None
@@ -543,9 +606,12 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
     use smithay::wayland::shm;
     use std::ptr;
 
+    let timestamp = state.start_time.elapsed();
+    let min_interval = capture_min_interval(state.config.backend.max_capture_fps);
+
     state
         .image_copy_capture_state
-        .promote_waiting_toplevel_frames(&mut state.pending_captures);
+        .promote_waiting_toplevel_frames(&mut state.pending_captures, timestamp, min_interval);
 
     let mut pending = Vec::new();
     let mut i = 0;
@@ -563,7 +629,6 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
         return;
     }
 
-    let timestamp = state.start_time.elapsed();
     let scale = Scale::from(1.0);
     let fail_reason = smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::ext_image_copy_capture_frame_v1::FailureReason::Unknown;
 
@@ -650,6 +715,7 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
             scale,
             Transform::Normal,
             capture.paint_cursors,
+            timestamp,
         ));
 
         // Try DMA-BUF first, fall back to SHM.
@@ -734,5 +800,25 @@ pub fn render_toplevel_captures(state: &mut crate::state::DriftWm, renderer: &mu
         } else {
             capture.frame.failed(fail_reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_min_interval;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_fps_is_unlimited() {
+        assert_eq!(capture_min_interval(0), None);
+    }
+
+    #[test]
+    fn positive_fps_maps_to_interval() {
+        assert_eq!(capture_min_interval(1), Some(Duration::from_secs(1)));
+        assert_eq!(
+            capture_min_interval(60),
+            Some(Duration::from_secs_f64(1.0 / 60.0))
+        );
     }
 }

@@ -113,6 +113,15 @@ impl SeatHandler for DriftWm {
         {
             self.update_focus_history(&focus.0);
         }
+
+        // Track the last window that actually held focus so the recompute can
+        // restore it after a layer surface (launcher) or lock screen goes away.
+        // Layer / lock surfaces aren't windows, so they never overwrite it.
+        if let Some(focus) = focused
+            && self.window_for_surface(&focus.0).is_some()
+        {
+            self.window_focus = Some(focus.clone());
+        }
     }
 }
 
@@ -681,6 +690,16 @@ use driftwm::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyMa
 
 impl ScreencopyHandler for DriftWm {
     fn frame(&mut self, screencopy: Screencopy) {
+        // A plain `copy` (e.g. grim) wants the current frame now, so kick a
+        // redraw: render_if_needed bails when redraws_needed is empty, and an
+        // idle-system capture would otherwise stall until unrelated damage.
+        //
+        // For copy_with_damage, forcing a render per pull would re-composite a
+        // static scene every frame, keeping the GPU busy and defeating direct
+        // scanout of a fullscreen client behind it; let real damage drive it.
+        if !screencopy.with_damage() {
+            self.redraws_needed.insert(screencopy.output().clone());
+        }
         self.pending_screencopies.push(screencopy);
     }
 
@@ -800,6 +819,20 @@ impl ImageCopyCaptureHandler for DriftWm {
     }
 
     fn capture_frame(&mut self, capture: PendingCapture) {
+        use driftwm::protocols::image_copy_capture::PendingCaptureKind;
+        // Kick a redraw so an idle-system capture is fulfilled promptly instead
+        // of stalling until unrelated damage. Toplevel captures drain on any
+        // output's render path, so the active output suffices.
+        match &capture.kind {
+            PendingCaptureKind::Output(output) => {
+                self.redraws_needed.insert(output.clone());
+            }
+            PendingCaptureKind::Toplevel(_) => {
+                if let Some(output) = self.active_output() {
+                    self.redraws_needed.insert(output);
+                }
+            }
+        }
         self.pending_captures.push(capture);
     }
 
@@ -971,9 +1004,10 @@ impl SessionLockHandler for DriftWm {
         self.held_action = None;
         self.cursor.grab_cursor = false;
         // Lock may swallow key releases and prevents focus history updates while
-        // mid-cycle; reset both so neither survives the locked window.
+        // mid-cycle; reset these so none survive the locked window.
         self.cycle_state = None;
         self.suppressed_keys.clear();
+        self.tap.reset();
         if let Some(pending) = self.pending_middle_click.take() {
             self.loop_handle.remove(pending.timer_token);
         }
@@ -1011,12 +1045,8 @@ impl SessionLockHandler for DriftWm {
         tracing::info!("Session unlocked");
         self.session_lock = SessionLock::Unlocked;
         self.lock_surfaces.clear();
-        // Restore focus to the most recent window
-        if let Some(window) = self.focus_history.first().cloned() {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            let focus = window.wl_surface().map(|s| FocusTarget(s.into_owned()));
-            self.set_keyboard_focus(focus, serial);
-        }
+        // Restore focus to the window (or layer) that owned it before locking.
+        self.update_keyboard_focus(smithay::utils::SERIAL_COUNTER.next_serial());
         self.mark_all_dirty();
     }
 

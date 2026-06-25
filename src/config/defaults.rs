@@ -4,13 +4,7 @@ use smithay::input::keyboard::{Keysym, keysyms};
 
 use super::types::*;
 
-pub(super) fn default_bindings(
-    mod_key: ModKey,
-    cycle_mod: CycleModifier,
-) -> HashMap<KeyCombo, Action> {
-    let terminal = detect_terminal();
-    let launcher = detect_launcher();
-
+pub(super) fn default_bindings(mod_key: ModKey) -> HashMap<KeyCombo, Action> {
     let m = mod_key.base();
     let m_shift = Modifiers {
         shift: true,
@@ -20,7 +14,12 @@ pub(super) fn default_bindings(
         ctrl: true,
         ..m.clone()
     };
-    let cyc = cycle_mod.base();
+    // The hold modifier follows whatever the user binds `cycle-windows forward`
+    // to (see `Config::cycle_hold`); this default matches that binding's default.
+    let cyc = Modifiers {
+        alt: true,
+        ..Modifiers::EMPTY
+    };
     let cyc_shift = Modifiers {
         shift: true,
         ..cyc.clone()
@@ -32,14 +31,14 @@ pub(super) fn default_bindings(
                 modifiers: m.clone(),
                 sym: Keysym::from(keysyms::KEY_Return),
             },
-            Action::Exec(terminal),
+            Action::ExecTerminal,
         ),
         (
             KeyCombo {
                 modifiers: m.clone(),
                 sym: Keysym::from(keysyms::KEY_d),
             },
-            Action::Exec(launcher),
+            Action::ExecLauncher,
         ),
         (
             KeyCombo {
@@ -318,6 +317,41 @@ pub(super) fn default_bindings(
                 sym: Keysym::from(keysyms::KEY_XF86MonBrightnessDown),
             },
             Action::Spawn("brightnessctl set 5%-".into()),
+        ),
+        (
+            KeyCombo {
+                modifiers: Modifiers::EMPTY,
+                sym: Keysym::from(keysyms::KEY_XF86AudioPlay),
+            },
+            Action::Spawn("playerctl play-pause".into()),
+        ),
+        (
+            KeyCombo {
+                modifiers: Modifiers::EMPTY,
+                sym: Keysym::from(keysyms::KEY_XF86AudioPause),
+            },
+            Action::Spawn("playerctl play-pause".into()),
+        ),
+        (
+            KeyCombo {
+                modifiers: Modifiers::EMPTY,
+                sym: Keysym::from(keysyms::KEY_XF86AudioNext),
+            },
+            Action::Spawn("playerctl next".into()),
+        ),
+        (
+            KeyCombo {
+                modifiers: Modifiers::EMPTY,
+                sym: Keysym::from(keysyms::KEY_XF86AudioPrev),
+            },
+            Action::Spawn("playerctl previous".into()),
+        ),
+        (
+            KeyCombo {
+                modifiers: Modifiers::EMPTY,
+                sym: Keysym::from(keysyms::KEY_XF86AudioStop),
+            },
+            Action::Spawn("playerctl stop".into()),
         ),
         // Screenshot
         (
@@ -707,44 +741,4 @@ pub(super) fn default_gesture_bindings(
         on_canvas,
         anywhere,
     }
-}
-
-fn detect_terminal() -> String {
-    if let Ok(term) = std::env::var("TERMINAL")
-        && !term.is_empty()
-    {
-        return term;
-    }
-    for cmd in ["foot", "alacritty", "ptyxis", "kitty", "wezterm"] {
-        if std::process::Command::new("which")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return cmd.to_string();
-        }
-    }
-    "foot".to_string()
-}
-
-fn detect_launcher() -> String {
-    if let Ok(launcher) = std::env::var("LAUNCHER")
-        && !launcher.is_empty()
-    {
-        return launcher;
-    }
-    for cmd in ["fuzzel", "wofi", "bemenu-run", "tofi"] {
-        if std::process::Command::new("which")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return cmd.to_string();
-        }
-    }
-    "fuzzel".to_string()
 }

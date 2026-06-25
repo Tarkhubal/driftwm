@@ -1,6 +1,6 @@
 use driftwm::config::{
     Action, BTN_RIGHT, BackgroundKind, BindingContext, Config, ContinuousAction,
-    GestureConfigEntry, GestureTrigger, MouseAction,
+    GestureConfigEntry, GestureTrigger, Modifiers, MouseAction,
 };
 use smithay::backend::input::AxisSource;
 use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
@@ -23,10 +23,6 @@ fn logo() -> ModifiersState {
 
 fn alt() -> ModifiersState {
     mods(true, false, false, false)
-}
-
-fn ctrl() -> ModifiersState {
-    mods(false, true, false, false)
 }
 
 // ── TOML round-trip integration tests ─────────────────────────────────────
@@ -245,6 +241,41 @@ fn toml_navigation_friction_is_migration_error_not_fatal() {
 }
 
 #[test]
+fn toml_snap_renamed_keys_are_migration_errors_not_fatal() {
+    // `same_edge`/`edge_center` were renamed to `corners`/`centers`, but
+    // deny_unknown_fields would otherwise make a stale value fail the whole
+    // parse — each must degrade to a migration message instead.
+    let toml = r#"
+        [snap]
+        same_edge = true
+        edge_center = true
+        gap = 20.0
+    "#;
+    let (config, warnings) =
+        Config::from_toml_collect(toml).expect("renamed snap keys should not fail the parse");
+    assert_eq!(
+        config.snap_gap, 20.0,
+        "rest of the config should still apply"
+    );
+    assert!(
+        !config.snap_corners && !config.snap_centers,
+        "corners/centers fall back to default (off)"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("same_edge") && w.contains("corners")),
+        "expected a same_edge→corners migration message, got {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("edge_center") && w.contains("centers")),
+        "expected an edge_center→centers migration message, got {warnings:?}"
+    );
+}
+
+#[test]
 fn toml_zoom_reset_policies_default_true() {
     let config = Config::from_toml("").unwrap();
     assert!(config.zoom_reset_on_new_window);
@@ -277,6 +308,22 @@ fn toml_auto_navigate_on_close_can_be_disabled() {
     "#;
     let config = Config::from_toml(toml).unwrap();
     assert!(!config.auto_navigate_on_close);
+}
+
+#[test]
+fn toml_resize_on_border_defaults_true() {
+    let config = Config::from_toml("").unwrap();
+    assert!(config.resize_on_border);
+}
+
+#[test]
+fn toml_resize_on_border_can_be_disabled() {
+    let toml = r#"
+        [mouse]
+        resize_on_border = false
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    assert!(!config.resize_on_border);
 }
 
 #[test]
@@ -319,19 +366,32 @@ fn toml_deny_unknown_fields() {
 }
 
 #[test]
-fn toml_cycle_modifier_ctrl() {
-    let config = Config::from_toml("cycle_modifier = \"ctrl\"").unwrap();
-    // Cycle bindings should now use Ctrl
-    let result = config.lookup(&ctrl(), Keysym::from(keysyms::KEY_Tab));
-    assert!(
-        matches!(result, Some(Action::CycleWindows { backward: false })),
-        "cycle_modifier=ctrl should bind Ctrl+Tab"
+fn cycle_hold_modifier_follows_forward_binding() {
+    // Default Alt+Tab cycling → the hold modifier (released to commit) is Alt.
+    let config = Config::from_toml("").unwrap();
+    assert_eq!(
+        config.cycle_hold,
+        Modifiers {
+            alt: true,
+            ..Modifiers::EMPTY
+        }
     );
-    // Alt+Tab should no longer be bound for cycling
-    let result = config.lookup(&alt(), Keysym::from(keysyms::KEY_Tab));
-    assert!(
-        result.is_none(),
-        "Alt+Tab should not be bound when cycle_modifier=ctrl"
+
+    // Rebinding cycle-windows forward moves the hold modifier with it — any
+    // modifier works now, not just alt/ctrl. (Unbind the default so there's a
+    // single forward binding.)
+    let toml = r#"
+        [keybindings]
+        "alt+tab" = "none"
+        "super+grave" = "cycle-windows forward"
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    assert_eq!(
+        config.cycle_hold,
+        Modifiers {
+            logo: true,
+            ..Modifiers::EMPTY
+        }
     );
 }
 

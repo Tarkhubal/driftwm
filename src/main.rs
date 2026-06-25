@@ -224,36 +224,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-    // Config watcher: poll mtime every 500ms.
+    // inotify watch instead of an mtime poll, so an idle session never wakes
+    // the CPU. Watch the directory, not the file: editor atomic-saves replace
+    // the file's inode, which would silently kill a file-level watch.
     {
+        use inotify::{Inotify, WatchMask};
+        use smithay::reexports::calloop::{Interest, Mode, PostAction, generic::Generic};
+        use std::os::fd::AsFd;
+
         let config_path = driftwm::config::config_path();
         data.config_file_mtime = std::fs::metadata(&config_path)
             .and_then(|m| m.modified())
             .ok();
+        // Resolve symlinks so a config linked from a dotfiles repo is watched at
+        // its real location; fall back to the literal path when it doesn't exist
+        // yet, so a later CREATE still fires.
+        let watch_path =
+            std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+        let config_dir = watch_path.parent().map(|p| p.to_owned());
+        let config_name = watch_path.file_name().map(|n| n.to_owned());
 
-        let timer = smithay::reexports::calloop::timer::Timer::from_duration(
-            std::time::Duration::from_millis(500),
-        );
-        event_loop
-            .handle()
-            .insert_source(timer, move |_, _, data: &mut DriftWm| {
-                let current_mtime = std::fs::metadata(&config_path)
-                    .and_then(|m| m.modified())
-                    .ok();
-                if current_mtime != data.config_file_mtime && current_mtime.is_some() {
-                    // Debounce: skip if <100ms old (editor may still be writing).
-                    let dominated_by_recent_write = current_mtime
-                        .is_some_and(|mt| mt.elapsed().is_ok_and(|age| age.as_millis() < 100));
-                    if !dominated_by_recent_write {
-                        data.config_file_mtime = current_mtime;
-                        data.reload_config();
+        match (config_dir, Inotify::init()) {
+            (Some(config_dir), Ok(mut inotify)) => {
+                if let Err(e) = inotify.watches().add(
+                    &config_dir,
+                    WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE,
+                ) {
+                    tracing::warn!("Config hot-reload disabled: cannot watch {config_dir:?}: {e}");
+                } else {
+                    // calloop only hands the callback a shared ref to the Generic's
+                    // payload, but read_events needs &mut. Poll a dup'd fd (same
+                    // inotify description) and keep the instance in the closure,
+                    // where it can be read mutably.
+                    match inotify.as_fd().try_clone_to_owned() {
+                        Ok(watch_fd) => {
+                            let source = Generic::new(watch_fd, Interest::READ, Mode::Level);
+                            let registered = event_loop.handle().insert_source(
+                                source,
+                                move |_, _, data: &mut DriftWm| {
+                                    let mut buffer = [0u8; 1024];
+                                    let touched = match inotify.read_events(&mut buffer) {
+                                        Ok(events) => events
+                                            .filter_map(|e| e.name)
+                                            .any(|n| Some(n) == config_name.as_deref()),
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            false
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("inotify read error: {e}");
+                                            false
+                                        }
+                                    };
+                                    // One save can emit several events (e.g. CREATE +
+                                    // MOVED_TO on an atomic rename); reload only when
+                                    // the file's mtime actually advances.
+                                    if touched {
+                                        let mtime = std::fs::metadata(&config_path)
+                                            .and_then(|m| m.modified())
+                                            .ok();
+                                        if mtime != data.config_file_mtime && mtime.is_some() {
+                                            data.config_file_mtime = mtime;
+                                            data.reload_config();
+                                        }
+                                    }
+                                    Ok(PostAction::Continue)
+                                },
+                            );
+                            if let Err(e) = registered {
+                                tracing::warn!("Config hot-reload disabled: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Config hot-reload disabled: fd clone failed: {e}");
+                        }
                     }
                 }
-                smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
-                    std::time::Duration::from_millis(500),
-                )
-            })?;
+            }
+            (None, _) => {
+                tracing::warn!("Config hot-reload disabled: config path has no parent directory");
+            }
+            (_, Err(e)) => {
+                tracing::warn!("Config hot-reload disabled: inotify init failed: {e}");
+            }
+        }
     }
+
+    // Drives the off-screen frame-callback heartbeat when no rendering is
+    // happening (#141); see send_frame_callbacks_fallback.
+    event_loop.handle().insert_source(
+        smithay::reexports::calloop::timer::Timer::from_duration(std::time::Duration::from_secs(1)),
+        |_, _, data: &mut DriftWm| {
+            crate::render::send_frame_callbacks_fallback(data);
+            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
+                std::time::Duration::from_secs(1),
+            )
+        },
+    )?;
 
     // After WAYLAND_DISPLAY is set so satellite can connect as a Wayland client.
     xwayland::setup(&mut data);

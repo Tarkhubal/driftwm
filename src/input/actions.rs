@@ -1,7 +1,7 @@
 use smithay::{
     input::{keyboard::Layout, pointer::MotionEvent},
     reexports::wayland_server::Resource,
-    utils::{Point, SERIAL_COUNTER, Size},
+    utils::{Logical, Point, SERIAL_COUNTER, Size},
     wayland::seat::WaylandFocus,
 };
 
@@ -18,6 +18,16 @@ use driftwm::window_ext::WindowExt;
 const CENTER_NEAREST_ANCHOR_THRESHOLD: f64 = 1.0;
 
 impl DriftWm {
+    /// Spawn a command and reveal the cursor briefly so the launched app is
+    /// easy to find.
+    fn exec_command(&mut self, cmd: &str) {
+        tracing::info!("Spawning: {cmd}");
+        crate::state::spawn_command(cmd, &self.config.child_env);
+        let now = std::time::Instant::now();
+        self.cursor.exec_cursor_show_at = Some(now + std::time::Duration::from_millis(150));
+        self.cursor.exec_cursor_deadline = Some(now + std::time::Duration::from_secs(5));
+    }
+
     pub fn execute_action(&mut self, action: &Action) {
         // Snapshot fullscreen window before the guard exits it.
         // Also check gesture_exited_fullscreen (set by exit_fullscreen_for_gesture
@@ -43,13 +53,9 @@ impl DriftWm {
 
         self.with_output_state(|os| os.momentum.stop());
         match action {
-            Action::Exec(cmd) => {
-                tracing::info!("Spawning: {cmd}");
-                crate::state::spawn_command(cmd, &self.config.child_env);
-                let now = std::time::Instant::now();
-                self.cursor.exec_cursor_show_at = Some(now + std::time::Duration::from_millis(150));
-                self.cursor.exec_cursor_deadline = Some(now + std::time::Duration::from_secs(5));
-            }
+            Action::Exec(cmd) => self.exec_command(cmd),
+            Action::ExecTerminal => self.exec_command(&detect_terminal()),
+            Action::ExecLauncher => self.exec_command(&detect_launcher()),
             Action::Spawn(cmd) => {
                 tracing::info!("Spawning (no cursor): {cmd}");
                 crate::state::spawn_command(cmd, &self.config.child_env);
@@ -205,7 +211,7 @@ impl DriftWm {
                     Some(NavTarget::Anchor(p)) => {
                         // Unfocus so next CenterNearest searches from viewport center (= this anchor)
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                        self.set_keyboard_focus(None, serial);
+                        self.set_window_focus(None, serial);
                         self.with_output_state(|os| os.momentum.stop());
                         let vc = self.usable_center_screen();
                         let zoom = self.zoom();
@@ -411,6 +417,36 @@ impl DriftWm {
                     self.raise_and_focus(&window, serial);
                 }
             }
+            Action::SendCursorToOutput(dir) => {
+                // The cursor's output (active_output), not keyboard focus or
+                // focus_follows_mouse: absolute devices stay pinned to it.
+                let Some(from_output) = self.active_output() else {
+                    return;
+                };
+                let Some(target_output) = self.output_in_direction(&from_output, dir) else {
+                    return;
+                };
+
+                // Center of the target output's usable area in canvas coords.
+                // Excludes layer-shell exclusive zones (panels) — same anchor
+                // send-to-output and window_placement = "center" use, so a
+                // panned cursor lands where new windows would.
+                let (target_cam, target_zoom) = {
+                    let os = crate::state::output_state(&target_output);
+                    (os.camera, os.zoom)
+                };
+                let target_vc = crate::state::usable_center_for_output(&target_output);
+                let target_canvas = Point::<f64, Logical>::from((
+                    target_cam.x + target_vc.x / target_zoom,
+                    target_cam.y + target_vc.y / target_zoom,
+                ));
+
+                self.warp_pointer(target_canvas);
+                // Match what the pointer-motion handler does on real cursor
+                // moves so the next action (center-nearest, focus, etc.) targets
+                // the new output even though no real motion event happened.
+                self.focused_output = Some(target_output);
+            }
             Action::SwitchLayout(target) => {
                 // with_xkb_state broadcasts the layout/modifier change to the
                 // focused client on exit, so the app sees the new layout too.
@@ -563,4 +599,62 @@ impl DriftWm {
         self.set_zoom_target(Some(target_zoom));
         self.set_camera_target(Some(new_camera));
     }
+}
+
+fn which(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `$TERMINAL`, else the first installed of a preference list, else `foot`.
+fn detect_terminal() -> String {
+    if let Ok(term) = std::env::var("TERMINAL")
+        && !term.is_empty()
+    {
+        return term;
+    }
+    for cmd in [
+        "foot",
+        "alacritty",
+        "ptyxis",
+        "kitty",
+        "wezterm",
+        "gnome-terminal",
+        "konsole",
+    ] {
+        if which(cmd) {
+            return cmd.to_string();
+        }
+    }
+    "foot".to_string()
+}
+
+/// `$LAUNCHER`, else the first installed of a preference list, else `fuzzel`.
+/// Detection probes only the binary; the returned string carries drun-mode
+/// flags so bare menus actually launch apps.
+fn detect_launcher() -> String {
+    if let Ok(launcher) = std::env::var("LAUNCHER")
+        && !launcher.is_empty()
+    {
+        return launcher;
+    }
+    for cmd in [
+        "fuzzel",
+        "wofi --show drun",
+        "rofi -show drun",
+        "bemenu-run",
+        "wmenu-run",
+        "tofi-drun",
+        "mew-run",
+    ] {
+        let bin = cmd.split_whitespace().next().unwrap();
+        if which(bin) {
+            return cmd.to_string();
+        }
+    }
+    "fuzzel".to_string()
 }

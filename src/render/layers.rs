@@ -183,6 +183,7 @@ pub(super) fn build_canvas_layer_elements(
     output_scale: f64,
     camera: Point<f64, Logical>,
     zoom: f64,
+    visible_rect: Rectangle<i32, Logical>,
 ) -> Vec<OutputRenderElements> {
     let scale: Scale<f64> = output_scale.into();
     let mut elements = Vec::new();
@@ -194,6 +195,13 @@ pub(super) fn build_canvas_layer_elements(
             let Some(pos) = cl.position else { continue };
             let bbox = cl.surface.bbox();
             if bbox.size.w <= 0 || bbox.size.h <= 0 {
+                continue;
+            }
+            // Cull off-viewport widgets: an animated widget parked off-screen
+            // would otherwise re-render and re-compose its output at full FPS.
+            let mut canvas_bbox = bbox;
+            canvas_bbox.loc += pos;
+            if !visible_rect.overlaps(canvas_bbox) {
                 continue;
             }
             let rel_x = pos.x as f64 - camera.x;

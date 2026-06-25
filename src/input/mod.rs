@@ -1,6 +1,6 @@
 mod actions;
 pub(crate) mod gestures;
-mod keyboard;
+pub(crate) mod keyboard;
 mod pointer;
 
 use smithay::{
@@ -104,9 +104,30 @@ impl DriftWm {
         }
     }
 
+    /// True when the event is relative motion under a locked pointer (typically a
+    /// fullscreen game). The pointer position is frozen (and the cursor usually
+    /// hidden) and the client redraws via its own surface commits, so a blanket
+    /// mark would only compete with its frames at mouse-poll rate.
+    fn is_relative_motion_to_locked_pointer<I: InputBackend>(&self, event: &InputEvent<I>) -> bool {
+        if !matches!(event, InputEvent::PointerMotion { .. }) {
+            return false;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        let Some(focus) = pointer.current_focus() else {
+            return false;
+        };
+        with_pointer_constraint(&focus.0, &pointer, |c| {
+            c.is_some_and(|c| c.is_active() && matches!(&*c, PointerConstraint::Locked(_)))
+        })
+    }
+
     /// Process a single input event from any backend (winit, libinput, etc).
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
-        self.mark_all_dirty();
+        if !self.is_relative_motion_to_locked_pointer(&event) {
+            self.mark_all_dirty();
+        }
 
         // Notify idle tracker of user activity (skip device add/remove metadata events).
         // Also wake any DPMS-off outputs — without this, recovering from
@@ -163,6 +184,20 @@ impl DriftWm {
                 _ => {}
             }
             return;
+        }
+
+        // Active pointer/gesture input on top of a held modifier chord makes it
+        // a binding prefix, not a tap — cancel any pending tap binding. Motion is
+        // passive (the cursor can drift mid-chord), so it's deliberately excluded.
+        if matches!(
+            event,
+            InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. }
+                | InputEvent::GestureSwipeBegin { .. }
+                | InputEvent::GesturePinchBegin { .. }
+                | InputEvent::GestureHoldBegin { .. }
+        ) {
+            self.tap.taint();
         }
 
         match event {
@@ -277,16 +312,18 @@ impl DriftWm {
             .or(Some(window))
             .and_then(|w| w.wl_surface().map(|s| FocusTarget(s.into_owned())));
 
-        let keyboard = self.seat.get_keyboard().unwrap();
+        // Compare against the window-focus intent, not the live keyboard focus:
+        // while a layer surface owns focus the latter never matches, which would
+        // re-run the focus recompute on every motion event.
         let already_focused = focus_surface
             .as_ref()
-            .is_some_and(|target| keyboard.current_focus().is_some_and(|f| f.0 == target.0));
+            .is_some_and(|target| self.window_focus.as_ref().is_some_and(|f| f.0 == target.0));
         if already_focused {
             return;
         }
 
         let serial = SERIAL_COUNTER.next_serial();
-        self.set_keyboard_focus(focus_surface, serial);
+        self.set_window_focus(focus_surface, serial);
     }
 
     /// Deactivate the constraint on the previous focus if focus changed,
@@ -828,6 +865,10 @@ impl DriftWm {
             return None;
         }
         let output = self.active_output()?;
+        // Fullscreen covers pinned windows on that output (like the top layer).
+        if self.is_output_fullscreen(&output) {
+            return None;
+        }
         let bar_height = self.config.decorations.title_bar_height;
         let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
 
@@ -910,6 +951,10 @@ impl DriftWm {
             return None;
         }
         let output = self.active_output()?;
+        // Fullscreen covers pinned windows on that output (like the top layer).
+        if self.is_output_fullscreen(&output) {
+            return None;
+        }
         let bar_height = self.config.decorations.title_bar_height;
         let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
 
@@ -933,19 +978,22 @@ impl DriftWm {
                 if crate::decorations::title_bar_contains(screen_pos, loc, size.w, bar_height) {
                     return Some((window.clone(), DecorationHit::TitleBar));
                 }
-                if let Some(edge) = crate::decorations::resize_edge_at(
-                    screen_pos,
-                    loc,
-                    size,
-                    bar_height,
-                    border_width,
-                ) {
+                if self.config.resize_on_border
+                    && let Some(edge) = crate::decorations::resize_edge_at(
+                        screen_pos,
+                        loc,
+                        size,
+                        bar_height,
+                        border_width,
+                    )
+                {
                     return Some((window.clone(), DecorationHit::ResizeBorder(edge)));
                 }
             } else {
                 let is_widget =
                     driftwm::config::applied_rule(&wl_surface).is_some_and(|r| r.widget);
-                if !is_widget
+                if self.config.resize_on_border
+                    && !is_widget
                     && let Some(edge) =
                         crate::decorations::resize_edge_at(screen_pos, loc, size, 0, border_width)
                 {
@@ -1084,8 +1132,9 @@ impl DriftWm {
                 if crate::decorations::title_bar_contains(pos, loc, size.w, bar_height) {
                     return Some((window.clone(), DecorationHit::TitleBar));
                 }
-                if let Some(edge) =
-                    crate::decorations::resize_edge_at(pos, loc, size, bar_height, border_width)
+                if self.config.resize_on_border
+                    && let Some(edge) =
+                        crate::decorations::resize_edge_at(pos, loc, size, bar_height, border_width)
                 {
                     return Some((window.clone(), DecorationHit::ResizeBorder(edge)));
                 }
@@ -1094,7 +1143,8 @@ impl DriftWm {
                 let is_widget =
                     driftwm::config::applied_rule(&wl_surface).is_some_and(|r| r.widget);
                 let is_fullscreen = self.fullscreen.values().any(|fs| &fs.window == window);
-                if !is_widget
+                if self.config.resize_on_border
+                    && !is_widget
                     && !is_fullscreen
                     && let Some(edge) =
                         crate::decorations::resize_edge_at(pos, loc, size, 0, border_width)

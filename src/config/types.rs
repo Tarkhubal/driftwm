@@ -45,9 +45,11 @@ impl Direction {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Exec(String),
+    ExecTerminal,
+    ExecLauncher,
     Spawn(String),
     CloseWindow,
     NudgeWindow(Direction),
@@ -66,6 +68,7 @@ pub enum Action {
     FitWindow,
     FitWindowSnapped,
     SendToOutput(Direction),
+    SendCursorToOutput(Direction),
     FocusCenter,
     TogglePinToScreen,
     SwitchLayout(LayoutSwitch),
@@ -105,13 +108,36 @@ impl Modifiers {
         logo: false,
     };
 
-    pub(super) fn from_state(state: &ModifiersState) -> Self {
+    pub fn from_state(state: &ModifiersState) -> Self {
         Self {
             ctrl: state.ctrl,
             alt: state.alt,
             shift: state.shift,
             logo: state.logo,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::EMPTY
+    }
+
+    /// Accumulates the high-water mark of a held chord for tap-modifier bindings.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            ctrl: self.ctrl || other.ctrl,
+            alt: self.alt || other.alt,
+            shift: self.shift || other.shift,
+            logo: self.logo || other.logo,
+        }
+    }
+
+    /// True if every modifier set in `self` is currently held in `state`. The
+    /// Alt-Tab cycle commits once its hold modifier is no longer all held.
+    pub fn all_held(&self, state: &ModifiersState) -> bool {
+        (!self.ctrl || state.ctrl)
+            && (!self.alt || state.alt)
+            && (!self.shift || state.shift)
+            && (!self.logo || state.logo)
     }
 }
 
@@ -161,35 +187,6 @@ impl ModKey {
     }
 }
 
-/// Which modifier must be held during window cycling (Alt-Tab style).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CycleModifier {
-    Alt,
-    Ctrl,
-}
-
-impl CycleModifier {
-    pub fn is_pressed(self, state: &ModifiersState) -> bool {
-        match self {
-            CycleModifier::Alt => state.alt,
-            CycleModifier::Ctrl => state.ctrl,
-        }
-    }
-
-    pub(crate) fn base(self) -> Modifiers {
-        match self {
-            CycleModifier::Alt => Modifiers {
-                alt: true,
-                ..Modifiers::EMPTY
-            },
-            CycleModifier::Ctrl => Modifiers {
-                ctrl: true,
-                ..Modifiers::EMPTY
-            },
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KeyCombo {
     pub modifiers: Modifiers,
@@ -232,7 +229,7 @@ pub struct MouseBinding {
     pub trigger: MouseTrigger,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MouseAction {
     MoveWindow,
     /// Drag every window connected to the focused one via snap adjacency
@@ -287,14 +284,14 @@ pub enum ContinuousAction {
 }
 
 /// Actions for threshold gesture triggers (fire once after accumulation).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ThresholdAction {
     CenterNearest,
     Fixed(Action),
 }
 
 /// Resolved at parse time from trigger + action combination.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GestureConfigEntry {
     Continuous(ContinuousAction),
     Threshold(ThresholdAction),
@@ -302,6 +299,7 @@ pub enum GestureConfigEntry {
 
 // ── Context bindings container ───────────────────────────────────────
 
+#[derive(Debug, PartialEq)]
 pub struct ContextBindings<K: Eq + Hash, V> {
     pub on_window: HashMap<K, V>,
     pub on_canvas: HashMap<K, V>,
@@ -476,6 +474,18 @@ impl Pattern {
     }
 }
 
+// `regex::Regex` isn't `PartialEq`; compare by source so `Pattern` (hence
+// `WindowRule`/`Config`) can derive equality.
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Pattern::Glob(a), Pattern::Glob(b)) => a == b,
+            (Pattern::Regex(a), Pattern::Regex(b)) => a.as_str() == b.as_str(),
+            _ => false,
+        }
+    }
+}
+
 /// Simple glob match — `*` matches any sequence of characters (including empty).
 /// Multiple `*` wildcards are supported. Case-sensitive.
 pub fn glob_matches(pat: &str, val: &str) -> bool {
@@ -515,7 +525,7 @@ pub fn glob_matches(pat: &str, val: &str) -> bool {
 /// - `None`  — default; compositor handles everything.
 /// - `All`   — all keys forwarded (game/fullscreen-friendly).
 /// - `Only`  — only the listed combos are forwarded; all others stay active.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum PassKeys {
     #[default]
     None,
@@ -563,7 +573,7 @@ impl PassKeys {
 }
 
 /// Parsed window rule from config.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowRule {
     // ── Match criteria (all that are Some must match) ─────────────────
     /// Wayland `app_id`. X11 apps proxied via xwayland-satellite arrive
@@ -721,6 +731,11 @@ pub struct BackendConfig {
     pub wait_for_frame_completion: bool,
     pub disable_direct_scanout: bool,
     pub disable_hardware_cursor: bool,
+    /// Max frames per second delivered to continuous screen-capture clients
+    /// (screen recorders / casts). 0 = unlimited. Caps the extra full-scene
+    /// re-composite a capture forces, which otherwise rides the compositor's
+    /// render rate and competes with a fullscreen client behind it.
+    pub max_capture_fps: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -876,7 +891,7 @@ impl DecorationConfig {
 }
 
 /// Settings for drawing outlines of other monitors' viewports.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutputOutlineSettings {
     pub color: [u8; 4],
     pub thickness: i32,
@@ -894,7 +909,7 @@ impl Default for OutputOutlineSettings {
 }
 
 /// Per-output configuration from `[[outputs]]` config sections.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutputConfig {
     pub name: String,
     pub scale: Option<f64>,
@@ -949,6 +964,9 @@ pub enum BackgroundKind {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BackgroundConfig {
     pub kind: BackgroundKind,
+    /// Mirror-fold a `Tile` image so non-seamless edges meet a reflection,
+    /// hiding tile seams. No-op for non-tile backgrounds.
+    pub mirror_tile: bool,
     /// Bake a static `u_camera`-only shader to chunked GPU textures and pan
     /// those, instead of recomputing the fragment shader every frame. No-op for
     /// non-shader backgrounds and for shaders using `u_time`/`u_zoom`.
