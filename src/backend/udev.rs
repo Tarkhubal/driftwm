@@ -19,7 +19,7 @@ use smithay::{
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            ImportDma,
+            ImportDma, RendererSuper,
             gles::GlesRenderer,
             multigpu::{MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
         },
@@ -82,6 +82,8 @@ pub type MultiGpuFrame<'render, 'frame, 'buffer> = MultiFrame<
     GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
     GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
 >;
+
+pub type MultiGpuRendererError<'render> = <MultiGpuRenderer<'render> as RendererSuper>::Error;
 
 struct DeviceData {
     drm: DrmDevice,

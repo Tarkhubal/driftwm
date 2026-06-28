@@ -1,5 +1,8 @@
+#[macro_use]
+mod render_elements_macro;
 mod background;
 mod blur;
+mod bridge;
 mod capture;
 mod capture_background;
 mod cursor;
