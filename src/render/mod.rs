@@ -31,7 +31,9 @@ pub use lifecycle::{
     post_render, refresh_foreign_toplevels, send_frame_callbacks_fallback,
     take_presentation_feedback, update_primary_scanout_output,
 };
-// TODO(multi-gpu): drop the allow once the render path consumes these.
+// Consumed internally via crate::render::renderer paths today; re-exported for
+// the upcoming compose_frame<R> genericization. TODO(multi-gpu): drop the allow
+// once an external module names these.
 #[allow(unused_imports)]
 pub use renderer::{AsGlesFrame, AsGlesRenderer, DriftRenderer};
 pub use screenshot::capture_region_to_png;

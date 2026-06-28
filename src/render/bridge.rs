@@ -97,7 +97,15 @@ where
         cache: Option<&UserDataMap>,
     ) -> Result<(), MultiGpuRendererError<'render>> {
         let frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(&self.0, frame, src, dst, damage, opaque_regions, cache)?;
+        RenderElement::<GlesRenderer>::draw(
+            &self.0,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )?;
         Ok(())
     }
 

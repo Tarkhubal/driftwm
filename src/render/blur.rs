@@ -12,6 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::OutputRenderElements;
+use super::bridge::GlesBridge;
 
 static BLUR_DOWN_SRC: &str = include_str!("../shaders/blur_down.glsl");
 static BLUR_UP_SRC: &str = include_str!("../shaders/blur_up.glsl");
@@ -615,7 +616,10 @@ pub(crate) fn process_blur_requests(
             cache.damage_bag.snapshot(),
             Kind::Unspecified,
         );
-        all_elements.insert(insert_idx, OutputRenderElements::Blur(blur_elem));
+        all_elements.insert(
+            insert_idx,
+            OutputRenderElements::Blur(GlesBridge(blur_elem)),
+        );
         index_shift += 1;
     }
 

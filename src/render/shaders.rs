@@ -9,6 +9,7 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 
+use super::bridge::GlesBridge;
 use super::elements::{OutputRenderElements, corner_round_rect};
 
 /// Uniform declarations for background shaders. All three are optional:
@@ -233,13 +234,13 @@ pub(super) fn push_shadow_element(
         elem.update_uniforms(fresh_uniforms);
     }
     elem.resize(shadow_area, None);
-    target.push(OutputRenderElements::Background(
+    target.push(OutputRenderElements::Background(GlesBridge(
         RescaleRenderElement::from_element(
             elem.clone(),
             Point::<i32, Physical>::from((0, 0)),
             zoom,
         ),
-    ));
+    )));
 }
 
 const BORDER_SHADER_SRC: &str = include_str!("../shaders/border.glsl");
@@ -434,13 +435,13 @@ pub(super) fn push_border_element(
         elem.update_uniforms(fresh_uniforms);
     }
     elem.resize(border_area, None);
-    target.push(OutputRenderElements::Background(
+    target.push(OutputRenderElements::Background(GlesBridge(
         RescaleRenderElement::from_element(
             elem.clone(),
             Point::<i32, Physical>::from((0, 0)),
             zoom,
         ),
-    ));
+    )));
 }
 
 const CORNER_CLIP_SRC: &str = include_str!("../shaders/corner_clip.glsl");

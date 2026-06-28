@@ -4,12 +4,16 @@
 // over R while others are Gles-only (wrapped in GlesBridge), so a single
 // generic impl block can't express both; we generate one impl per concrete
 // renderer and bridge through AsGlesFrame in the element draws.
-#[allow(unused_macros)]
 macro_rules! drift_render_elements {
     ($name:ident<R> => { $($variant:ident = $type:ty),+ $(,)? }) => {
+        // No #[derive(Debug)]: some variants (e.g. RoundedCornerElement<R>) hold a
+        // renderer-parameterized inner that isn't Debug for the multi-GPU renderer.
+        // The smithay render_elements! enum this replaces wasn't Debug either.
         #[allow(clippy::large_enum_variant)]
-        #[derive(Debug)]
-        pub enum $name<R: $crate::render::renderer::DriftRenderer> {
+        pub enum $name<
+            R: $crate::render::renderer::DriftRenderer
+                = smithay::backend::renderer::gles::GlesRenderer,
+        > {
             $($variant($type)),+
         }
 

@@ -8,6 +8,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use driftwm::config::BackgroundKind;
 
+use super::bridge::GlesBridge;
 use super::elements::{OutputRenderElements, TileShaderElement};
 use super::shaders::{
     BG_UNIFORMS, compile_textured_bg_shader, compile_tile_bg_mirror_shader, compile_tile_bg_shader,
@@ -75,9 +76,9 @@ impl BackgroundElement {
         let origin = Point::<i32, Physical>::from((0, 0));
         Some(match &self.kind {
             BgKind::None => return None,
-            BgKind::Shader(e) => OutputRenderElements::Background(
+            BgKind::Shader(e) => OutputRenderElements::Background(GlesBridge(
                 RescaleRenderElement::from_element(e.clone(), origin, zoom),
-            ),
+            )),
             // Tile and textured-shader share the canvas-sized, zoom-rescaled path.
             BgKind::Tile(e) | BgKind::TexturedShader(e) => OutputRenderElements::TileBg(
                 RescaleRenderElement::from_element(e.clone(), origin, zoom),
