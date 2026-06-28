@@ -353,9 +353,10 @@ pub(crate) fn render_elements_to_rgba(
 
 /// Render elements directly into a client-provided DMA-BUF (zero CPU copies).
 ///
-/// The caller must choose the correct `transform` for the protocol:
-/// - wlr-screencopy: `output.current_transform()` (buffer is raw mode size)
-/// - ext-image-copy-capture: `Transform::Normal` (buffer is already transformed)
+/// The caller passes the output transform so the buffer is filled in scanout
+/// orientation (raw mode size); the client orients it via the output transform
+/// (ext-image-copy-capture in the frame's `transform` event, wlr-screencopy
+/// out-of-band from `wl_output`).
 ///
 /// When `capture_state` is provided, reuses the damage tracker for incremental rendering.
 fn render_to_dmabuf(
@@ -439,7 +440,7 @@ pub fn render_capture_frames(
     let output_scale = output.current_scale().fractional_scale();
     let scale = Scale::from(output_scale);
     let output_transform = output.current_transform();
-    let output_mode_size = output_transform.transform_size(output.current_mode().unwrap().size);
+    let output_mode_size = output.current_mode().unwrap().size;
     let capture_key = format!("cap:{}", output.name());
 
     let fail_reason = smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::server::ext_image_copy_capture_frame_v1::FailureReason::Unknown;
@@ -460,8 +461,7 @@ pub fn render_capture_frames(
                 .collect()
         };
 
-        // ext-image-copy-capture buffer_size is already in transformed/logical orientation,
-        // matching the element coordinate space — render with Normal (no additional transform).
+        // Persistent damage-tracker state only applies to full-output captures.
         let use_persistent = capture.buffer_size == output_mode_size;
 
         if use_persistent
@@ -481,7 +481,7 @@ pub fn render_capture_frames(
                     &capture_key,
                     capture.buffer_size,
                     scale,
-                    Transform::Normal,
+                    output_transform,
                     paint_cursors,
                     timestamp,
                 ))
@@ -493,7 +493,7 @@ pub fn render_capture_frames(
                 &mut dmabuf,
                 capture.buffer_size,
                 scale,
-                Transform::Normal,
+                output_transform,
                 &use_elements,
                 cs,
             ) {
@@ -517,7 +517,7 @@ pub fn render_capture_frames(
                     &capture_key,
                     capture.buffer_size,
                     scale,
-                    Transform::Normal,
+                    output_transform,
                     paint_cursors,
                     timestamp,
                 ))
@@ -528,7 +528,7 @@ pub fn render_capture_frames(
                 renderer,
                 capture.buffer_size,
                 scale,
-                Transform::Normal,
+                output_transform,
                 Fourcc::Xrgb8888,
                 &use_elements,
                 cs,

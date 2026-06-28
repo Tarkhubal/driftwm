@@ -308,9 +308,12 @@ where
                 });
 
                 let buffer_size = match &kind {
+                    // Raw mode size in buffer pixel (scanout) coordinates. The frame's
+                    // `transform` event lets the client orient it; advertising the
+                    // transformed size here would skew rotated outputs.
                     SourceKind::Output(output) => output
                         .current_mode()
-                        .map(|m| output.current_transform().transform_size(m.size))
+                        .map(|m| m.size)
                         .unwrap_or((1, 1).into()),
                     SourceKind::Toplevel { initial_size, .. } => *initial_size,
                     SourceKind::Destroyed => (1, 1).into(),
