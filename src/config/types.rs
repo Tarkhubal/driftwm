@@ -373,6 +373,17 @@ impl Default for TrackpadSettings {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TouchSettings {
+    pub enable: bool,
+}
+
+impl Default for TouchSettings {
+    fn default() -> Self {
+        Self { enable: true }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MouseDeviceSettings {
     pub accel_speed: f64,
     pub accel_profile: AccelProfile,
@@ -609,6 +620,10 @@ pub struct WindowRule {
     /// Per-window shadow toggle. Ignored for `decoration = "none"`. `None`
     /// means inherit `[decorations] shadow`.
     pub shadow: Option<bool>,
+    /// Output name (e.g. `"DP-1"`) this window should fullscreen onto. Overrides
+    /// the client-requested output; `None` defers to the client's request, then
+    /// the active output.
+    pub output: Option<String>,
 }
 
 impl WindowRule {
@@ -647,6 +662,7 @@ pub struct AppliedWindowRule {
     pub border_color_focused: Option<[u8; 4]>,
     pub corner_radius: Option<i32>,
     pub shadow: Option<bool>,
+    pub output: Option<String>,
 }
 
 impl AppliedWindowRule {
@@ -692,6 +708,9 @@ impl AppliedWindowRule {
         if let Some(sh) = rule.shadow {
             self.shadow = Some(sh);
         }
+        if rule.output.is_some() {
+            self.output = rule.output.clone();
+        }
     }
 }
 
@@ -711,6 +730,7 @@ impl From<&WindowRule> for AppliedWindowRule {
             border_color_focused: rule.border_color_focused,
             corner_radius: rule.corner_radius,
             shadow: rule.shadow,
+            output: rule.output.clone(),
         }
     }
 }

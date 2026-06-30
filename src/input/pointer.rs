@@ -37,7 +37,7 @@ impl DriftWm {
         // SSD chrome and the CSD resize margin sit outside the surface bbox, so
         // `element_under` misses them; count them as OnWindow so on-window bindings
         // apply over the chrome, not just the client surface.
-        let over_window = self.space.element_under(pos).is_some()
+        let over_window = self.element_under(pos).is_some()
             || self.canvas_layer_under(pos).is_some()
             || self.decoration_under(pos).is_some();
         if over_window {
@@ -156,6 +156,22 @@ impl DriftWm {
                 } else if fs_lookup.is_some() {
                     pos = self.exit_fullscreen_remap_pointer(pos);
                 } else {
+                    // Reclaim keyboard focus for the fullscreen window before
+                    // forwarding — hover on another output may have moved focus
+                    // to its window, and a plain forward wouldn't restore it.
+                    // Skip when it already holds focus so a click doesn't re-emit
+                    // a keyboard enter (and a popup grab keeps its focus).
+                    if let Some(surface) = self
+                        .active_fullscreen()
+                        .and_then(|fs| fs.window.wl_surface())
+                        .map(|s| FocusTarget(s.into_owned()))
+                    {
+                        let already = self.window_focus.as_ref().is_some_and(|f| f.0 == surface.0);
+                        if !already {
+                            let focus_serial = SERIAL_COUNTER.next_serial();
+                            self.set_window_focus(Some(surface), focus_serial);
+                        }
+                    }
                     pointer.button(
                         self,
                         &ButtonEvent {
@@ -306,7 +322,7 @@ impl DriftWm {
                     MouseAction::MoveWindow | MouseAction::MoveSnappedWindows => {
                         let want_cluster = matches!(action, MouseAction::MoveSnappedWindows);
                         if let Some((window, _)) =
-                            self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+                            self.element_under(pos).map(|(w, l)| (w.clone(), l))
                             && let Some(surface) = window.wl_surface()
                             && !config::applied_rule(&surface).is_some_and(|r| r.widget)
                             && !self.is_pinned(&window)
@@ -353,7 +369,7 @@ impl DriftWm {
                         // grab behaves like pre-slice-2 single-window resize.
                         let want_cluster = matches!(action, MouseAction::ResizeWindowSnapped);
                         if let Some((window, _)) =
-                            self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+                            self.element_under(pos).map(|(w, l)| (w.clone(), l))
                             && !window
                                 .wl_surface()
                                 .and_then(|s| config::applied_rule(&s))
@@ -400,7 +416,7 @@ impl DriftWm {
                     }
                     MouseAction::Action(ref action) => {
                         if let Some((window, _)) =
-                            self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+                            self.element_under(pos).map(|(w, l)| (w.clone(), l))
                         {
                             self.raise_and_focus(&window, serial);
                         }
@@ -412,7 +428,7 @@ impl DriftWm {
             }
 
             // Hardcoded fallbacks: click-to-focus, empty-canvas-pan
-            let element_under = self.space.element_under(pos).map(|(w, _)| w.clone());
+            let element_under = self.element_under(pos).map(|(w, _)| w.clone());
 
             if let Some(ref window) = element_under {
                 let is_widget = window
@@ -733,6 +749,8 @@ impl DriftWm {
             constraints,
             cluster_resize,
             pinned_initial_screen_pos,
+            touch_start: None,
+            touch_slots: 0,
         };
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }

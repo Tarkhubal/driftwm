@@ -553,6 +553,8 @@ impl DriftWm {
             constraints,
             cluster_resize,
             pinned_initial_screen_pos: None,
+            touch_start: None,
+            touch_slots: 0,
         };
         let pointer = self.seat.get_pointer().unwrap();
         pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -590,8 +592,7 @@ impl DriftWm {
         }
         // SSD chrome (title bar / border) lies outside the surface bbox, so
         // `element_under` misses it; fall back to a decoration hit-test.
-        self.space
-            .element_under(pos)
+        self.element_under(pos)
             .map(|(w, l)| (w.clone(), l))
             .or_else(|| {
                 self.decoration_under(pos)

@@ -182,6 +182,14 @@ Default: `false`
 
 reverse scroll direction
 
+## `[input.touch]`
+
+### `enable`
+
+Default: `true`
+
+enable touchscreen support
+
 ## `[cursor]`
 
 ### `theme`
@@ -215,6 +223,12 @@ trackpad (scroll/gestures) pan multiplier
 Default: `1.0`
 
 mouse (drag) pan multiplier (1.0 = direct)
+
+### `touch_speed`
+
+Default: `1.0`
+
+touchscreen gesture pan speed multiplier
 
 ### `drift`
 
@@ -297,6 +311,12 @@ cursor edge-pan activation zone (px) — kept small so it doesn't trigger by acc
 Default: `1.1`
 
 multiplier per keypress (1.1 = 10% per press)
+
+### `touch_speed`
+
+Default: `1.0`
+
+touchscreen gesture zoom speed multiplier
 
 ### `fit_padding`
 
@@ -848,6 +868,8 @@ Default: `0.5`
 
 Per-output configuration. Each [[outputs]] entry matches by connector name. Find connector names with wlr-randr or check driftwm logs at startup. Outputs without a matching entry default to scale 1.0. Winit backend ignores [[outputs]] entries.
 
+`mode` accepts "preferred", "WxH", or "WxH@Hz". A bare "WxH" only selects a mode the monitor already advertises — if none matches, it keeps the preferred mode (logged as a warning, not an error). "WxH@Hz" forces that exact mode, synthesizing a CVT modeline when the monitor doesn't advertise it (intended for CRTs or forcing non-standard modes; may be rejected by some panels).
+
 **Example:**
 
 ```toml
@@ -903,6 +925,7 @@ Effect fields:
 - `border_color_focused` — per-window focused border color hex.
 - `corner_radius` — per-window corner radius override (px). Affects content clip, border shape, and shadow. Ignored for decoration = "none".
 - `shadow` — per-window shadow toggle. Overrides [decorations] shadow. Ignored for decoration = "none".
+- `output` — output name (e.g. "DP-1") this window fullscreens onto. Takes precedence over the output the client itself requests. Omit to honor the client's request, then the active output. Find names under `outputs.*` in `driftwm msg state`. (default: unset)
 - `pass_keys` — controls which compositor keybindings are forwarded to the app:
   - pass_keys = true — forward ALL keys (game-friendly)
   - pass_keys = ["mod+q", "ctrl+q"] — forward ONLY these combos; all other compositor shortcuts stay active
@@ -961,6 +984,14 @@ pass_keys = ["ctrl+q"]
 [[window_rules]]
 app_id    = "/^steam_app_\\d+$/"
 pass_keys = true
+```
+
+**Example: Always open this game fullscreen on a specific monitor**
+
+```toml
+[[window_rules]]
+app_id = "steam_app_*"
+output = "DP-1"
 ```
 
 **Example: Compose rules, blur from first rule, opacity from second (both apply)**

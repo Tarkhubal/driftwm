@@ -244,6 +244,7 @@ impl DriftWm {
             ..Default::default()
         });
         seat.add_pointer();
+        seat.add_touch();
 
         let autostart = config.autostart.clone();
         let edge_pan_cursor = config.edge_pan_cursor;
@@ -317,7 +318,7 @@ impl DriftWm {
             pending_center: HashSet::new(),
             pending_size: HashSet::new(),
             pending_fit: HashSet::new(),
-            pending_fullscreen: HashSet::new(),
+            pending_fullscreen: HashMap::new(),
             auto_anchor_snapshot: HashMap::new(),
             pending_recenter: HashMap::new(),
             stable_snap_rects: HashMap::new(),
@@ -342,6 +343,8 @@ impl DriftWm {
             state_file_layout: String::new(),
             state_file_windows: Vec::new(),
             state_file_layer_count: 0,
+            state_file_pinned: Vec::new(),
+            state_file_fullscreen: Vec::new(),
             autostart,
             active_outputs: HashSet::new(),
             redraws_needed: HashSet::new(),
@@ -362,6 +365,7 @@ impl DriftWm {
             last_titlebar_click: None,
             errors: init_errors,
             cursor_edge_pan: edge_pan_cursor,
+            touch_state: crate::input::touch::TouchState::new(),
         }
     }
 }

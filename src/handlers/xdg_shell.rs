@@ -168,14 +168,15 @@ impl XdgShellHandler for DriftWm {
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        _output: Option<wl_output::WlOutput>,
+        output: Option<wl_output::WlOutput>,
     ) {
         let wl_surface = surface.wl_surface().clone();
+        let client_output = output.and_then(|wo| smithay::output::Output::from_resource(&wo));
         // Defer until the first sized commit — geometry is still (0,0)
         // here, which would poison `saved_size`, and the initial-commit
         // positioning block would clobber the fullscreen map.
         if self.pending_center.contains(&wl_surface) {
-            self.pending_fullscreen.insert(wl_surface);
+            self.pending_fullscreen.insert(wl_surface, client_output);
             return;
         }
         let window = self
@@ -184,7 +185,8 @@ impl XdgShellHandler for DriftWm {
             .find(|w| w.wl_surface().as_deref() == Some(&wl_surface))
             .cloned();
         if let Some(window) = window {
-            self.enter_fullscreen(&window);
+            let target = self.resolve_fullscreen_output(&wl_surface, client_output);
+            self.enter_fullscreen(&window, target);
         }
     }
 
@@ -385,43 +387,74 @@ impl XdgShellHandler for DriftWm {
             return;
         };
 
-        let pointer = self.seat.get_pointer().unwrap();
-        let Some(start_data) = check_grab(&pointer, &wl_surface) else {
-            return;
-        };
-
-        // Pinned windows move in screen space. A canvas grab would only shuffle
-        // the loc-synced canvas position while the window keeps rendering at its
-        // fixed `screen_pos` — i.e. the CSD titlebar drag would do nothing.
-        if self.pinned.contains_key(&wl_surface.id()) {
-            self.start_pinned_move(
-                &pointer,
-                &window,
-                start_data.location,
-                start_data.button,
-                serial,
-            );
-            return;
-        }
-
         // Client-initiated xdg move_request: the client asked to move itself,
         // not its cluster neighbors. Clients don't know about clusters, so
         // always single-window.
-        let Some(initial_window_location) = self.space.element_location(&window) else {
+        let pointer = self.seat.get_pointer().unwrap();
+        if let Some(start_data) = check_grab(&pointer, &wl_surface) {
+            // Pinned windows move in screen space. A canvas grab would only
+            // shuffle the loc-synced canvas position while the window keeps
+            // rendering at its fixed `screen_pos` — i.e. the drag would do nothing.
+            if self.pinned.contains_key(&wl_surface.id()) {
+                self.start_pinned_move(
+                    &pointer,
+                    &window,
+                    start_data.location,
+                    start_data.button,
+                    serial,
+                );
+                return;
+            }
+            let Some(initial_window_location) = self.space.element_location(&window) else {
+                return;
+            };
+            let Some(output) = self.active_output() else {
+                return;
+            };
+            let grab = MoveSurfaceGrab::new(
+                start_data,
+                window,
+                initial_window_location,
+                output,
+                Vec::new(),
+                HashSet::new(),
+            );
+            pointer.set_grab(self, grab, serial, Focus::Clear);
             return;
-        };
-        let Some(output) = self.active_output() else {
-            return;
-        };
-        let grab = MoveSurfaceGrab::new(
-            start_data,
-            window,
-            initial_window_location,
-            output,
-            Vec::new(),
-            HashSet::new(),
-        );
-        pointer.set_grab(self, grab, serial, Focus::Clear);
+        }
+
+        // Touch-initiated move: a CSD client dragging its own titlebar requests
+        // the move off a touch grab, not a pointer grab. (SSD titlebars are moved
+        // by the compositor's own hit-test in `input/touch.rs`, never via here.)
+        if let Some(touch) = self.seat.get_touch()
+            && let Some(touch_start) = check_touch_grab(&touch, &wl_surface)
+        {
+            // Pinned touch move isn't supported (matches the SSD touch path).
+            if self.pinned.contains_key(&wl_surface.id()) {
+                return;
+            }
+            let Some(initial_window_location) = self.space.element_location(&window) else {
+                return;
+            };
+            let Some(output) = self.touch_output() else {
+                return;
+            };
+            // The finger's `down` was forwarded to the client (Forward mode), and
+            // smithay routes touch motion/up to the slot's stored focus regardless
+            // of the grab — so cancel the client's sequence before the compositor
+            // takes over the drag, or it keeps receiving the whole sequence.
+            touch.cancel(self);
+            let grab = MoveSurfaceGrab::new_touch(
+                touch_start,
+                window,
+                initial_window_location,
+                output,
+                1,
+                Vec::new(),
+                HashSet::new(),
+            );
+            touch.set_grab(self, grab, serial);
+        }
     }
 
     fn resize_request(
@@ -512,6 +545,8 @@ impl XdgShellHandler for DriftWm {
             constraints,
             cluster_resize,
             pinned_initial_screen_pos,
+            touch_start: None,
+            touch_slots: 0,
         };
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }
@@ -530,6 +565,22 @@ fn check_grab(
     let (focus, _) = start_data.focus.as_ref()?;
 
     // The button press must have been on this surface (or a child of it)
+    if !focus.same_client_as(&surface.id()) {
+        return None;
+    }
+
+    Some(start_data)
+}
+
+/// Touch analogue of `check_grab`: validate that the active touch grab started
+/// on (a child of) the given surface, returning its start data.
+fn check_touch_grab(
+    touch: &smithay::input::touch::TouchHandle<DriftWm>,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<smithay::input::touch::GrabStartData<DriftWm>> {
+    let start_data = touch.grab_start_data()?;
+    let (focus, _) = start_data.focus.as_ref()?;
+
     if !focus.same_client_as(&surface.id()) {
         return None;
     }

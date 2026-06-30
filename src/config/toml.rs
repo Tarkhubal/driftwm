@@ -52,6 +52,13 @@ pub(super) struct InputConfig {
     pub keyboard: KeyboardConfig,
     pub trackpad: TrackpadConfig,
     pub mouse: MouseDeviceFileConfig,
+    pub touch: TouchDeviceFileConfig,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct TouchDeviceFileConfig {
+    pub enable: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -106,6 +113,7 @@ pub(super) struct NavigationConfig {
     pub pan_step: Option<f64>,
     pub trackpad_speed: Option<f64>,
     pub mouse_speed: Option<f64>,
+    pub touch_speed: Option<f64>,
     pub drift: Option<f64>,
     /// Renamed to `drift`; kept only so a stale value yields a migration error
     /// instead of failing the whole parse via `deny_unknown_fields`.
@@ -135,6 +143,7 @@ pub(super) struct ZoomConfig {
     pub fit_padding: Option<f64>,
     pub reset_on_new_window: Option<bool>,
     pub reset_on_activation: Option<bool>,
+    pub touch_speed: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -241,6 +250,9 @@ pub(super) struct WindowRuleFile {
     pub border_color_focused: Option<String>,
     pub corner_radius: Option<i32>,
     pub shadow: Option<bool>,
+    /// Output name (e.g. `"DP-1"`) this window should fullscreen onto, overriding
+    /// the client-requested output.
+    pub output: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

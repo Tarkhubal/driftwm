@@ -326,6 +326,11 @@ delegate_ext_data_control!(DriftWm);
 
 impl PointerConstraintsHandler for DriftWm {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        // Pointer constraints track pointer focus internally, so bring it up to
+        // date before activating: a client that re-creates a oneshot constraint
+        // (destroyed on deactivation) needs current focus for the new one to
+        // re-arm, e.g. a game whose cursor returns to its fullscreen surface.
+        self.refresh_pointer_focus();
         self.maybe_activate_pointer_constraint();
     }
 
@@ -639,9 +644,10 @@ impl ForeignToplevelHandler for DriftWm {
         }
     }
 
-    fn set_fullscreen(&mut self, wl_surface: WlSurface, _wl_output: Option<WlOutput>) {
+    fn set_fullscreen(&mut self, wl_surface: WlSurface, wl_output: Option<WlOutput>) {
+        let client_output = wl_output.and_then(|wo| smithay::output::Output::from_resource(&wo));
         if self.pending_center.contains(&wl_surface) {
-            self.pending_fullscreen.insert(wl_surface);
+            self.pending_fullscreen.insert(wl_surface, client_output);
             return;
         }
         let window = self
@@ -650,7 +656,8 @@ impl ForeignToplevelHandler for DriftWm {
             .find(|w| w.wl_surface().as_deref() == Some(&wl_surface))
             .cloned();
         if let Some(window) = window {
-            self.enter_fullscreen(&window);
+            let target = self.resolve_fullscreen_output(&wl_surface, client_output);
+            self.enter_fullscreen(&window, target);
         }
     }
 

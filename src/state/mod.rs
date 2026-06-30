@@ -473,7 +473,10 @@ pub struct DriftWm {
     /// first sized commit. Deferred until after first-commit positioning so
     /// `restore_size` / `saved_size` capture the client's preferred geometry.
     pub pending_fit: HashSet<WlSurface>,
-    pub pending_fullscreen: HashSet<WlSurface>,
+    /// Surfaces that requested fullscreen before their first sized commit,
+    /// mapped to the client-requested output (if any). Resolved against window
+    /// rules + active output when the deferred fullscreen fires on first commit.
+    pub pending_fullscreen: HashMap<WlSurface, Option<Output>>,
     /// Keyboard focus snapshot captured at `new_toplevel` time, keyed by the
     /// new surface. `Some(None)` means user had no focus (e.g. clicked empty
     /// canvas); missing entry means snapshot was already consumed.
@@ -535,6 +538,12 @@ pub struct DriftWm {
     pub state_file_layout: String,
     pub state_file_windows: Vec<crate::ipc::protocol::WindowInfo>,
     pub state_file_layer_count: usize,
+    /// Sorted `(output, screen_pos, size)` of screen-pinned windows and
+    /// `(output, app_id)` of fullscreen windows. Both are excluded from the
+    /// canvas window list, so they need their own change detection to keep the
+    /// state file's per-output sections from going stale.
+    pub state_file_pinned: Vec<(String, [i32; 2], [i32; 2])>,
+    pub state_file_fullscreen: Vec<(String, String)>,
 
     pub autostart: Vec<String>,
 
@@ -599,6 +608,8 @@ pub struct DriftWm {
     /// touches a screen edge. Toggled by
     /// [`Action::ToggleCursorPan`](driftwm::config::Action::ToggleCursorPan).
     pub cursor_edge_pan: bool,
+
+    pub touch_state: crate::input::touch::TouchState,
 }
 
 #[derive(Default)]
@@ -1226,11 +1237,19 @@ impl DriftWm {
             .is_some_and(|s| self.pinned.contains_key(&s.id()))
     }
 
-    /// True if `window` is a real canvas window — neither a widget (wallpaper
-    /// layer, immovable) nor screen-pinned. The eligibility test for canvas
-    /// operations: navigation, centering, fitting, snapping, zoom-to-fit, etc.
+    /// True if `window` is currently fullscreen on some output.
+    pub fn is_window_fullscreen(&self, window: &Window) -> bool {
+        self.fullscreen.values().any(|fs| &fs.window == window)
+    }
+
+    /// True if `window` is a real canvas window — not a widget (wallpaper
+    /// layer, immovable), screen-pinned, or fullscreen. The eligibility test
+    /// for canvas operations: navigation, centering, fitting, snapping,
+    /// zoom-to-fit, etc. A fullscreen window fills its own output and is parked
+    /// at that output's camera origin, so it must never join another output's
+    /// snap/cluster/fit geometry.
     pub fn is_canvas_window(&self, window: &Window) -> bool {
-        !window.is_widget() && !self.is_pinned(window)
+        !window.is_widget() && !self.is_pinned(window) && !self.is_window_fullscreen(window)
     }
 
     /// Effective render transform for `window` in one pass: the pre-zoom,
@@ -1254,6 +1273,20 @@ impl DriftWm {
     ) -> Option<(Point<f64, Logical>, f64)> {
         let loc = self.space.element_location(window)?;
         let geom_loc = window.geometry().loc;
+        // A fullscreen window is visible only on its own output. For any other
+        // output — and for the off-screen capture pass (`output == None`) — it
+        // must not render: it keeps a real canvas coord at its output's
+        // camera origin, so another monitor's camera would otherwise pan over
+        // it. On its own output it falls through to the canvas branch below,
+        // which yields (0,0) at zoom 1 thanks to the camera-park.
+        if !self.fullscreen.is_empty()
+            && let Some(fs_output) = window
+                .wl_surface()
+                .and_then(|s| self.find_fullscreen_output_for_surface(&s))
+            && output != Some(&fs_output)
+        {
+            return None;
+        }
         let pinned = window.wl_surface().and_then(|s| {
             self.pinned
                 .get(&s.id())
@@ -1393,6 +1426,15 @@ impl DriftWm {
     }
     pub fn set_camera(&mut self, val: Point<f64, Logical>) {
         if let Some(o) = self.active_output() {
+            // Invariant: a fullscreen window is parked at its output's
+            // camera-origin at zoom 1, so the camera must not move or it slides
+            // off (0,0) and re-exposes to other cameras. Nav paths that reach
+            // set_camera already exit fullscreen first; this is a backstop so a
+            // future set_camera caller can't silently reintroduce the bleed.
+            // (`enter_fullscreen` snaps via output_state directly to bypass it.)
+            if self.fullscreen.contains_key(&o) {
+                return;
+            }
             output_state(&o).camera = val;
         }
     }
@@ -1738,7 +1780,7 @@ impl DriftWm {
             .wl_surface()
             .and_then(|s| driftwm::config::applied_rule(&s))
             .is_some_and(|r| r.widget);
-        let is_fs = self.fullscreen.values().any(|fs| &fs.window == focused);
+        let is_fs = self.is_window_fullscreen(focused);
         if widget || is_fs || self.is_pinned(focused) {
             return None;
         }
@@ -1763,7 +1805,7 @@ impl DriftWm {
                 .wl_surface()
                 .and_then(|s| driftwm::config::applied_rule(&s))
                 .is_some_and(|r| r.widget);
-            let is_fs = self.fullscreen.values().any(|fs| &fs.window == w);
+            let is_fs = self.is_window_fullscreen(w);
             if widget || is_fs || self.is_pinned(w) {
                 continue;
             }

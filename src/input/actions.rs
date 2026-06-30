@@ -142,7 +142,7 @@ impl DriftWm {
                 let pos = pointer.current_location();
                 // Pinned windows live in screen space (no canvas position to
                 // center the camera on) — skip them here.
-                if let Some((window, _)) = self.space.element_under(pos) {
+                if let Some((window, _)) = self.element_under(pos) {
                     let window = window.clone();
                     if !self.is_pinned(&window) {
                         self.navigate_to_window(&window, true);
@@ -157,11 +157,18 @@ impl DriftWm {
                 }
 
                 let focused = self.focused_window().filter(|w| !self.is_pinned(w));
-                let viewport_center = self.viewport_center_canvas();
 
-                let (origin, skip) = if let Some(ref w) = focused
-                    && self.window_visible_at_least(w, CENTER_NEAREST_ANCHOR_THRESHOLD)
-                {
+                // Anchor the directional search to the just-exited fullscreen
+                // window (wherever the restored view placed it) — otherwise the
+                // anchor falls back to a corner/offscreen spot and the swipe
+                // finds nothing.
+                let anchor = was_fullscreen.clone().or_else(|| {
+                    focused.filter(|w| {
+                        self.window_visible_at_least(w, CENTER_NEAREST_ANCHOR_THRESHOLD)
+                    })
+                });
+
+                let (origin, skip) = if let Some(ref w) = anchor {
                     let center = self.window_visual_center(w).unwrap_or_else(|| {
                         let loc = self.space.element_location(w).unwrap_or_default();
                         let size = w.geometry().size;
@@ -172,7 +179,7 @@ impl DriftWm {
                     });
                     (center, Some(NavTarget::Window(w.clone())))
                 } else {
-                    (viewport_center, None)
+                    (self.viewport_center_canvas(), None)
                 };
 
                 let windows = self
@@ -229,21 +236,42 @@ impl DriftWm {
                 }
 
                 let len = self.focus_history.len();
-                if let Some(ref mut idx) = self.cycle_state {
+                let step = |i: usize| {
                     if *backward {
-                        *idx = (*idx + len - 1) % len;
+                        (i + len - 1) % len
                     } else {
-                        *idx = (*idx + 1) % len;
+                        (i + 1) % len
                     }
-                } else {
-                    // First Tab press: jump to previous window (index 1)
-                    self.cycle_state = Some(1 % len);
+                };
+                // First Tab press jumps to the previous window (index 1).
+                let mut idx = match self.cycle_state {
+                    Some(cur) => step(cur),
+                    None => 1 % len,
+                };
+                // The active output's fullscreen was already exited above (not
+                // allowlisted), so any fullscreen entry left here is on another
+                // output — shown only on its own monitor, never a target here.
+                // Bounded by `len` so an all-fullscreen history can't loop.
+                let mut steps = 0;
+                while steps < len
+                    && self
+                        .focus_history
+                        .get(idx)
+                        .is_some_and(|w| self.is_window_fullscreen(w))
+                {
+                    idx = step(idx);
+                    steps += 1;
                 }
-
-                let idx = self.cycle_state.unwrap();
-                if let Some(window) = self.focus_history.get(idx).cloned() {
-                    self.navigate_to_window(&window, false);
-                }
+                let Some(window) = self
+                    .focus_history
+                    .get(idx)
+                    .filter(|w| !self.is_window_fullscreen(w))
+                    .cloned()
+                else {
+                    return;
+                };
+                self.cycle_state = Some(idx);
+                self.navigate_to_window(&window, false);
             }
             Action::HomeToggle => {
                 let viewport_size = self.get_viewport_size();
@@ -266,7 +294,7 @@ impl DriftWm {
                             // Set camera/zoom directly — enter_fullscreen locks the viewport
                             self.set_camera(ret.camera);
                             self.set_zoom(ret.zoom);
-                            self.enter_fullscreen(ret.fullscreen_window.as_ref().unwrap());
+                            self.enter_fullscreen(ret.fullscreen_window.as_ref().unwrap(), None);
                         } else {
                             let vc = self.usable_center_screen();
                             self.set_zoom_animation_center(Some(Point::from((
@@ -376,12 +404,30 @@ impl DriftWm {
                 }
             }
             Action::ToggleFullscreen => {
-                if self.is_fullscreen() {
+                let focused = self.focused_window().filter(|w| !w.is_widget());
+                if was_fullscreen.is_some() && !self.is_fullscreen() {
+                    // A gesture exited the active output's fullscreen before this
+                    // ran — the toggle is done; don't re-enter or reach into
+                    // another output's fullscreen.
+                } else if let Some(output) = focused
+                    .as_ref()
+                    .and_then(|w| w.wl_surface())
+                    .and_then(|s| self.find_fullscreen_output_for_surface(&s))
+                {
+                    // Toggle the focused window, not the active output: Mod+F
+                    // exits a fullscreen window wherever it lives — keyboard focus
+                    // can be on it while the pointer is on another monitor, where
+                    // `is_fullscreen()` (active output) reads false.
+                    self.exit_fullscreen_on(&output);
+                } else if self.is_fullscreen() {
+                    // The focused window isn't fullscreen (focus on a layer, a
+                    // windowed window, or nothing) but the active output is.
                     self.exit_fullscreen();
-                } else if was_fullscreen.is_some() {
-                    // Gesture already exited fullscreen — don't re-enter
-                } else if let Some(window) = self.focused_window().filter(|w| !w.is_widget()) {
-                    self.enter_fullscreen(&window);
+                } else if let Some(window) = focused {
+                    let target = window
+                        .wl_surface()
+                        .and_then(|s| self.resolve_fullscreen_output(&s, None));
+                    self.enter_fullscreen(&window, target);
                 }
             }
             Action::FitWindow => {
