@@ -208,7 +208,10 @@ impl DmabufHandler for DriftWm {
             notifier.failed();
             return;
         };
-        if backend.renderer().import_dmabuf(&dmabuf, None).is_ok() {
+        if backend
+            .with_renderer(|r| r.import_dmabuf(&dmabuf, None))
+            .is_ok()
+        {
             let _ = notifier.successful::<DriftWm>();
         } else {
             notifier.failed();

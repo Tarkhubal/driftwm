@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- Made the capture path (wlr-screencopy and ext-image-copy-capture for outputs
-  and toplevels) generic over the renderer: elements render through `R`, while
-  pixel readback (`copy_framebuffer` / `map_texture`) runs on the primary GPU via
-  `as_gles_renderer()`. The off-screen canvas screenshot path stays on the
-  concrete `GlesRenderer`. No behaviour change on the single-GPU / winit path.
+- Introduced a multi-GPU renderer manager on the udev backend: `Backend::Udev`
+  now holds a `GpuManager` (one GLES renderer per DRM render node) plus the
+  primary render node, and the render loop drives the primary output through
+  `gpu_manager.single_renderer(node)` (a `MultiRenderer`). One-off renderer work
+  (shader compilation, dmabuf import, off-screen screenshot) goes through a new
+  `Backend::with_renderer` accessor. No behaviour change for a single-GPU setup;
+  this is the groundwork for scanning out to displays on a secondary GPU.

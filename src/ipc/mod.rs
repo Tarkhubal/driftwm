@@ -327,8 +327,7 @@ fn cmd_screenshot(target: &ScreenshotTarget, scale: f64, path: &str, state: &mut
         .backend
         .take()
         .ok_or("no renderer available for capture")?;
-    let result = {
-        let renderer = backend.renderer();
+    let result = backend.with_renderer(|renderer| {
         crate::render::capture_region_to_png(
             state,
             renderer,
@@ -337,7 +336,7 @@ fn cmd_screenshot(target: &ScreenshotTarget, scale: f64, path: &str, state: &mut
             include_background,
             std::path::Path::new(path),
         )
-    };
+    });
     state.backend = Some(backend);
 
     let cap = result?;

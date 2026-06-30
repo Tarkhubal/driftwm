@@ -21,7 +21,7 @@ use smithay::{
         renderer::{
             ImportDma, RendererSuper,
             gles::GlesRenderer,
-            multigpu::{MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
+            multigpu::{GpuManager, MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{self, UdevBackend, UdevEvent},
@@ -45,7 +45,6 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use crate::backend::Backend;
 use crate::backend::cvt;
 use crate::backend::gamma::{GammaProps, set_gamma_for_crtc_legacy};
-use crate::render::OutputRenderElements;
 use crate::state::{DriftWm, init_output_state};
 use driftwm::config::{OutputMode as ConfigOutputMode, OutputPosition};
 use smithay::wayland::seat::WaylandFocus;
@@ -84,6 +83,16 @@ pub type MultiGpuFrame<'render, 'frame, 'buffer> = MultiFrame<
 >;
 
 pub type MultiGpuRendererError<'render> = <MultiGpuRenderer<'render> as RendererSuper>::Error;
+
+/// The udev backend's renderer state stored on `Backend::Udev`. Holds the
+/// multi-GPU manager (one GLES renderer per DRM render node) and the primary
+/// render node. `gpu_manager.single_renderer(&primary_render_node)` yields a
+/// `MultiGpuRenderer` for same-GPU work; for an output on another GPU,
+/// `gpu_manager.renderer(primary, target, fmt)` adds the implicit PRIME copy.
+pub struct UdevRenderer {
+    pub gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    pub primary_render_node: DrmNode,
+}
 
 struct DeviceData {
     drm: DrmDevice,
@@ -384,7 +393,14 @@ pub fn init_udev(
     // 3. Try each GPU until one has connected displays
     let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
 
-    let (mut drm, drm_notifier, gbm, renderer, render_formats, render_node) = 'found: {
+    // Multi-GPU manager: one GLES renderer per render node, created lazily as
+    // nodes are added. The primary node's renderer is used for same-GPU work;
+    // outputs on other GPUs go through a cross-GPU MultiRenderer (PRIME copy).
+    let mut gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>> =
+        GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High))
+            .map_err(|e| format!("Failed to create GPU manager: {e}"))?;
+
+    let (mut drm, drm_notifier, gbm, render_formats, render_node) = 'found: {
         for path in &gpu_paths {
             let node = match DrmNode::from_path(path) {
                 Ok(n) => n,
@@ -478,15 +494,6 @@ pub fn init_udev(
                     !is_ccs
                 })
                 .collect();
-            let renderer =
-                match unsafe { smithay::backend::renderer::gles::GlesRenderer::new(egl_context) } {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("{}: failed to create GLES renderer ({e})", path.display());
-                        continue;
-                    }
-                };
-
             // Ask EGL/Mesa for the actual rendering device — on split-DRM
             // systems the KMS node we opened has no render node, but Mesa
             // routes rendering through the right GPU under the hood. We need
@@ -505,22 +512,34 @@ pub fn init_udev(
                     node
                 });
 
+            // Drop the probe context before handing the GBM device to the GPU
+            // manager, which creates its own EGL display + GLES renderer for the
+            // render node (avoids two high-priority contexts on the same device).
+            drop(egl_context);
+            if let Err(e) = gpu_manager.as_mut().add_node(render_node, gbm.clone()) {
+                tracing::warn!(
+                    "{}: failed to add render node to GPU manager ({e})",
+                    path.display()
+                );
+                continue;
+            }
+
             tracing::info!("Using GPU: {}", path.display());
-            break 'found (
-                drm,
-                drm_notifier,
-                gbm,
-                renderer,
-                render_formats,
-                render_node,
-            );
+            break 'found (drm, drm_notifier, gbm, render_formats, render_node);
         }
         return Err("No GPU with connected displays found (are you running from a TTY?)".into());
     };
 
     // 4. Store renderer on state + create DMA-BUF global
-    data.backend = Some(Backend::Udev(Box::new(renderer)));
-    let formats = data.backend.as_mut().unwrap().renderer().dmabuf_formats();
+    data.backend = Some(Backend::Udev(Box::new(UdevRenderer {
+        gpu_manager,
+        primary_render_node: render_node,
+    })));
+    let formats = data
+        .backend
+        .as_mut()
+        .unwrap()
+        .with_renderer(|r| r.dmabuf_formats());
     data.render_device = Some(render_node.dev_id());
     // Capture clients allocate buffers we render INTO, so advertise the
     // render-target set (already CCS-filtered above) — not the wider
@@ -626,15 +645,15 @@ pub fn init_udev(
     // Uses first surface's mode for initial background element size (resized per-frame anyway)
     {
         let mut backend = data.backend.take().unwrap();
-        data.render.shadow_shader = crate::render::compile_shadow_shader(backend.renderer());
-        data.render.border_shader = crate::render::compile_border_shader(backend.renderer());
-        data.render.corner_clip_shader =
-            crate::render::compile_corner_clip_shader(backend.renderer());
-        let (blur_down, blur_up, blur_mask) =
-            crate::render::compile_blur_shaders(backend.renderer());
-        data.render.blur_down_shader = blur_down;
-        data.render.blur_up_shader = blur_up;
-        data.render.blur_mask_shader = blur_mask;
+        backend.with_renderer(|r| {
+            data.render.shadow_shader = crate::render::compile_shadow_shader(r);
+            data.render.border_shader = crate::render::compile_border_shader(r);
+            data.render.corner_clip_shader = crate::render::compile_corner_clip_shader(r);
+            let (blur_down, blur_up, blur_mask) = crate::render::compile_blur_shaders(r);
+            data.render.blur_down_shader = blur_down;
+            data.render.blur_up_shader = blur_up;
+            data.render.blur_mask_shader = blur_mask;
+        });
         data.backend = Some(backend);
     }
 
@@ -1487,9 +1506,24 @@ fn render_frame(
         }
     }
 
-    // Take renderer out to split borrow from state
+    // Take the backend out to split the borrow from state, then grab a
+    // MultiRenderer for the whole frame. This output lives on the primary GPU
+    // (render == target node), so single_renderer; an output hanging off another
+    // GPU will use gpu_manager.renderer(primary, target, fmt) for the PRIME copy.
     let mut backend = data.backend.take().unwrap();
-    let renderer = backend.renderer();
+    let Backend::Udev(udev) = &mut backend else {
+        data.backend = Some(backend);
+        return;
+    };
+    let mut renderer = match udev.gpu_manager.single_renderer(&udev.primary_render_node) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to acquire primary renderer: {e:?}");
+            data.backend = Some(backend);
+            queue_estimated_vblank_timer(data, output, crtc);
+            return;
+        }
+    };
 
     // Build cursor + compose frame
     let cursor_alpha = if data.active_output().as_ref() == Some(output) {
@@ -1501,7 +1535,7 @@ fn render_frame(
     let _cursor_span = tracy_client::span!("udev::build_cursor_elements");
     let cursor_elements = crate::render::build_cursor_elements(
         data,
-        renderer,
+        &mut renderer,
         cur_camera,
         cur_zoom,
         output.current_scale().fractional_scale(),
@@ -1509,8 +1543,7 @@ fn render_frame(
     );
     #[cfg(feature = "profile-with-tracy")]
     drop(_cursor_span);
-    let renderer = backend.renderer();
-    let elements = crate::render::compose_frame(data, renderer, output, cursor_elements);
+    let elements = crate::render::compose_frame(data, &mut renderer, output, cursor_elements);
 
     // Overlay planes are left off — they cause hard-to-diagnose flicker on some
     // hardware. disable_hardware_cursor composites the cursor into the frame instead
@@ -1530,11 +1563,10 @@ fn render_frame(
     }
 
     // Render via DRM compositor (latency-sensitive — do first)
-    let renderer = backend.renderer();
     #[cfg(feature = "profile-with-tracy")]
     let _composite_span = tracy_client::span!("udev::compositor_render_frame");
-    let render_result = compositor.render_frame::<_, OutputRenderElements>(
-        renderer,
+    let render_result = compositor.render_frame(
+        &mut renderer,
         &elements,
         [0.0f32, 0.0, 0.0, 1.0],
         frame_flags,
@@ -1592,18 +1624,15 @@ fn render_frame(
     // Fulfill capture requests after main render
     #[cfg(feature = "profile-with-tracy")]
     let _captures_span = tracy_client::span!("udev::captures");
-    let renderer = backend.renderer();
-    crate::render::render_screencopy(data, renderer, output, &elements);
-
-    let renderer = backend.renderer();
-    crate::render::render_capture_frames(data, renderer, output, &elements);
-
-    let renderer = backend.renderer();
-    crate::render::render_toplevel_captures(data, renderer);
+    crate::render::render_screencopy(data, &mut renderer, output, &elements);
+    crate::render::render_capture_frames(data, &mut renderer, output, &elements);
+    crate::render::render_toplevel_captures(data, &mut renderer);
     #[cfg(feature = "profile-with-tracy")]
     drop(_captures_span);
 
-    // Put backend back
+    // Drop the renderer (borrows the backend's GPU manager) before putting the
+    // backend back on state.
+    drop(renderer);
     data.backend = Some(backend);
 
     // Record camera+zoom for next-frame change detection
