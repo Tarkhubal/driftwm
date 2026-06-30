@@ -120,10 +120,10 @@ struct SurfaceData {
     pending_gamma_change: Option<Option<Vec<u16>>>,
 }
 
-/// Opaque handle to udev backend device data. Returned by init_udev,
-/// stored on `DriftWm::udev_device` (single owner). Rc-cloneable so the
-/// render loop and gamma-control handler can each grab an independent
-/// `RefCell` borrow without re-routing through DriftWm.
+/// Opaque handle to udev backend device data. Returned by init_udev, stored in
+/// `DriftWm::udev_devices` keyed by KMS node. Rc-cloneable so the render loop
+/// and gamma-control handler can each grab an independent `RefCell` borrow
+/// without re-routing through DriftWm.
 #[derive(Clone)]
 pub(crate) struct UdevDevice(Rc<RefCell<DeviceData>>);
 
@@ -180,9 +180,10 @@ impl UdevDevice {
 
 /// Tick animations once for all outputs, mark dirty CRTCs, then render.
 ///
-/// Reads the `UdevDevice` from `data.udev_device` (single owner). Cheap
-/// `Rc` clone so we hold an independent `RefCell` borrow without conflicting
-/// with mutations on `data`.
+/// Iterates `data.udev_devices`, cloning each `Rc` handle out first so we hold
+/// an independent `RefCell` borrow without conflicting with mutations on
+/// `data`. Today only the primary device is populated; per-device frame
+/// orchestration is revisited when a secondary GPU is lit up.
 pub(crate) fn render_if_needed(data: &mut DriftWm) {
     // Fast path: nothing needs attention — skip all work when idle
     let any_chunked_pending = data
@@ -212,135 +213,144 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     data.render
         .evict_idle_capture_state(data.start_time.elapsed());
 
-    let Some(device) = data.udev_device.clone() else {
+    // Clone the device handles out so each borrow is independent of `data`.
+    let devices: Vec<UdevDevice> = data.udev_devices.values().cloned().collect();
+    if devices.is_empty() {
         return;
-    };
+    }
 
-    // 1. Tick animations once for all outputs (before device borrow)
+    // 1. Tick animations once for all outputs (before device borrows)
     data.tick_all_animations();
 
     // Emit the one coalesced pointer motion for this frame, after animations.
     data.flush_pointer_resync();
 
-    let mut dev = device.0.borrow_mut();
+    // TODO(multi-gpu): the per-device body below still drains global queues
+    // (pending_dpms, pending_mode_changes) and notifies output management from
+    // within the first device's iteration. Correct while only one device is
+    // populated; revisit when a second GPU is driven (steps 5/6).
+    for device in devices {
+        let mut dev = device.0.borrow_mut();
 
-    // Skip all rendering when DRM is paused (VT switch away). Without this the
-    // event loop wakes constantly on client commits and spam-retries render,
-    // pegging a CPU and starving the rest of the system.
-    if !dev.drm.is_active() {
-        return;
-    }
+        // Skip rendering when this device's DRM is paused (VT switch away).
+        // Without this the event loop wakes constantly on client commits and
+        // spam-retries render, pegging a CPU and starving the rest of the system.
+        if !dev.drm.is_active() {
+            continue;
+        }
 
-    // 2. Drain pending DPMS transitions before animation marking so DPMS-off
-    //    outputs don't get re-dirtied below.
-    if !data.pending_dpms.is_empty() {
-        let pending: Vec<(Output, bool)> = data.pending_dpms.drain().collect();
-        for (output, on) in &pending {
-            let Some((&crtc, surface)) = dev.surfaces.iter_mut().find(|(_, s)| s.output == *output)
-            else {
-                continue;
-            };
-            if *on {
-                data.redraws_needed.insert(output.clone());
-            } else {
-                if let Err(e) = surface.compositor.clear() {
-                    tracing::warn!(
-                        "DPMS off: compositor.clear failed for '{}': {e:?}",
-                        output.name()
-                    );
-                }
-                data.redraws_needed.remove(output);
-                data.frames_pending.remove(&crtc);
-                if let Some(token) = data.estimated_vblank_timers.remove(&crtc) {
-                    data.loop_handle.remove(token);
+        // 2. Drain pending DPMS transitions before animation marking so DPMS-off
+        //    outputs don't get re-dirtied below.
+        if !data.pending_dpms.is_empty() {
+            let pending: Vec<(Output, bool)> = data.pending_dpms.drain().collect();
+            for (output, on) in &pending {
+                let Some((&crtc, surface)) =
+                    dev.surfaces.iter_mut().find(|(_, s)| s.output == *output)
+                else {
+                    continue;
+                };
+                if *on {
+                    data.redraws_needed.insert(output.clone());
+                } else {
+                    if let Err(e) = surface.compositor.clear() {
+                        tracing::warn!(
+                            "DPMS off: compositor.clear failed for '{}': {e:?}",
+                            output.name()
+                        );
+                    }
+                    data.redraws_needed.remove(output);
+                    data.frames_pending.remove(&crtc);
+                    if let Some(token) = data.estimated_vblank_timers.remove(&crtc) {
+                        data.loop_handle.remove(token);
+                    }
                 }
             }
+            // Broadcast mode events for client-initiated changes (already sent
+            // inline) plus anything else that drifted; idempotent.
+            driftwm::protocols::output_power::OutputPowerState::refresh(data);
         }
-        // Broadcast mode events for client-initiated changes (already sent
-        // inline) plus anything else that drifted; idempotent.
-        driftwm::protocols::output_power::OutputPowerState::refresh(data);
-    }
 
-    // Mark outputs dirty for per-output animations.
-    for (_, surface) in dev.surfaces.iter() {
-        if data.dpms_off_outputs.contains(&surface.output) {
-            continue;
+        // Mark outputs dirty for per-output animations.
+        for (_, surface) in dev.surfaces.iter() {
+            if data.dpms_off_outputs.contains(&surface.output) {
+                continue;
+            }
+            if data.output_has_active_animations(&surface.output) {
+                data.redraws_needed.insert(surface.output.clone());
+            }
+            // Chunked-bg with tiles still to upload: keep firing frames until the
+            // visible set fully resolves. Otherwise the loop idles after pan
+            // stops and blurry chunks stay covered by the fallback plane until
+            // unrelated damage (cursor, animation, client commit) wakes us.
+            if let Some(cache) = data.render.cached_tile_chunks.get(&surface.output.name())
+                && cache.has_pending_loads()
+            {
+                data.redraws_needed.insert(surface.output.clone());
+            }
+            // Same for chunked shader-bake: refine sharp chunks after pan stops.
+            if let Some(cache) = data.render.cached_shader_chunks.get(&surface.output.name())
+                && cache.has_pending_bakes()
+            {
+                data.redraws_needed.insert(surface.output.clone());
+            }
         }
-        if data.output_has_active_animations(&surface.output) {
-            data.redraws_needed.insert(surface.output.clone());
-        }
-        // Chunked-bg with tiles still to upload: keep firing frames until the
-        // visible set fully resolves. Otherwise the loop idles after pan
-        // stops and blurry chunks stay covered by the fallback plane until
-        // unrelated damage (cursor, animation, client commit) wakes us.
-        if let Some(cache) = data.render.cached_tile_chunks.get(&surface.output.name())
-            && cache.has_pending_loads()
+
+        // Global animations (key repeat, cursor) → every output.
+        if data.held_action.is_some()
+            || data.cursor.exec_cursor_show_at.is_some()
+            || data.cursor.exec_cursor_deadline.is_some()
+            || data.cursor_is_animated()
         {
-            data.redraws_needed.insert(surface.output.clone());
+            data.mark_all_dirty();
+        } else if data.render.background_is_animated {
+            // Fullscreen outputs skip the background entirely, so an animated bg
+            // gives them nothing to redraw — marking them just burns battery.
+            let dirty: Vec<_> = data
+                .active_outputs
+                .iter()
+                .filter(|o| !data.is_output_fullscreen(o))
+                .cloned()
+                .collect();
+            data.redraws_needed.extend(dirty);
         }
-        // Same for chunked shader-bake: refine sharp chunks after pan stops.
-        if let Some(cache) = data.render.cached_shader_chunks.get(&surface.output.name())
-            && cache.has_pending_bakes()
-        {
-            data.redraws_needed.insert(surface.output.clone());
+
+        // 4. Foreign toplevel refresh (once per frame, not per-output)
+        crate::render::refresh_foreign_toplevels(data);
+
+        // 4a. Drain queued mode changes before re-notifying clients so the
+        // re-broadcast reflects the new mode state. Mode changes either come from
+        // wlr-output-management Apply or from config reload.
+        if !data.pending_mode_changes.is_empty() {
+            // Borrow-split: iter_mut on `surfaces` reborrows the whole RefMut.
+            // Same pattern as the hotplug callback at line ~527.
+            let DeviceData { drm, surfaces, .. } = &mut *dev;
+            apply_pending_mode_changes(drm, surfaces, data);
         }
-    }
 
-    // Global animations (key repeat, cursor) → every output.
-    if data.held_action.is_some()
-        || data.cursor.exec_cursor_show_at.is_some()
-        || data.cursor.exec_cursor_deadline.is_some()
-        || data.cursor_is_animated()
-    {
-        data.mark_all_dirty();
-    } else if data.render.background_is_animated {
-        // Fullscreen outputs skip the background entirely, so an animated bg
-        // gives them nothing to redraw — marking them just burns battery.
-        let dirty: Vec<_> = data
-            .active_outputs
-            .iter()
-            .filter(|o| !data.is_output_fullscreen(o))
-            .cloned()
-            .collect();
-        data.redraws_needed.extend(dirty);
-    }
-
-    // 4. Foreign toplevel refresh (once per frame, not per-output)
-    crate::render::refresh_foreign_toplevels(data);
-
-    // 4a. Drain queued mode changes before re-notifying clients so the
-    // re-broadcast reflects the new mode state. Mode changes either come from
-    // wlr-output-management Apply or from config reload.
-    if !data.pending_mode_changes.is_empty() {
-        // Borrow-split: iter_mut on `surfaces` reborrows the whole RefMut.
-        // Same pattern as the hotplug callback at line ~527.
-        let DeviceData { drm, surfaces, .. } = &mut *dev;
-        apply_pending_mode_changes(drm, surfaces, data);
-    }
-
-    // 4b. Re-notify output management clients after apply_output_config
-    if data.output_config_dirty {
-        data.output_config_dirty = false;
-        let head_state = collect_output_state_from_surfaces(&dev.surfaces, &dev.drm);
-        driftwm::protocols::output_management::notify_changes::<DriftWm>(
-            &mut data.output_management_state,
-            head_state,
-        );
-    }
-
-    // Render outputs that need it.
-    for (&crtc, surface) in dev.surfaces.iter_mut() {
-        if data.dpms_off_outputs.contains(&surface.output) {
-            data.redraws_needed.remove(&surface.output);
-            continue;
+        // 4b. Re-notify output management clients after apply_output_config
+        if data.output_config_dirty {
+            data.output_config_dirty = false;
+            let head_state = collect_output_state_from_surfaces(&dev.surfaces, &dev.drm);
+            driftwm::protocols::output_management::notify_changes::<DriftWm>(
+                &mut data.output_management_state,
+                head_state,
+            );
         }
-        // An armed estimated-VBlank timer counts as waiting, like frames_pending:
-        // re-rendering before either resolves spins render_frame past refresh rate.
-        if data.redraws_needed.contains(&surface.output)
-            && !data.frames_pending.contains(&crtc)
-            && !data.estimated_vblank_timers.contains_key(&crtc)
-        {
-            render_frame(data, &mut surface.compositor, &surface.output, crtc);
+
+        // Render outputs that need it.
+        for (&crtc, surface) in dev.surfaces.iter_mut() {
+            if data.dpms_off_outputs.contains(&surface.output) {
+                data.redraws_needed.remove(&surface.output);
+                continue;
+            }
+            // An armed estimated-VBlank timer counts as waiting, like frames_pending:
+            // re-rendering before either resolves spins render_frame past refresh rate.
+            if data.redraws_needed.contains(&surface.output)
+                && !data.frames_pending.contains(&crtc)
+                && !data.estimated_vblank_timers.contains_key(&crtc)
+            {
+                render_frame(data, &mut surface.compositor, &surface.output, crtc);
+            }
         }
     }
 }
@@ -348,7 +358,7 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
 pub fn init_udev(
     event_loop: &mut EventLoop<'static, DriftWm>,
     data: &mut DriftWm,
-) -> Result<UdevDevice, Box<dyn std::error::Error>> {
+) -> Result<(DrmNode, UdevDevice), Box<dyn std::error::Error>> {
     // 1. Create libseat session
     let (mut session, session_notifier) = LibSeatSession::new()
         .map_err(|e| format!("Failed to create session (are you running from a TTY?): {e}"))?;
@@ -400,7 +410,7 @@ pub fn init_udev(
         GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High))
             .map_err(|e| format!("Failed to create GPU manager: {e}"))?;
 
-    let (mut drm, drm_notifier, gbm, render_formats, render_node) = 'found: {
+    let (mut drm, drm_notifier, gbm, render_formats, render_node, kms_node) = 'found: {
         for path in &gpu_paths {
             let node = match DrmNode::from_path(path) {
                 Ok(n) => n,
@@ -525,7 +535,7 @@ pub fn init_udev(
             }
 
             tracing::info!("Using GPU: {}", path.display());
-            break 'found (drm, drm_notifier, gbm, render_formats, render_node);
+            break 'found (drm, drm_notifier, gbm, render_formats, render_node, node);
         }
         return Err("No GPU with connected displays found (are you running from a TTY?)".into());
     };
@@ -906,7 +916,7 @@ pub fn init_udev(
         );
     }
 
-    Ok(UdevDevice(device))
+    Ok((kms_node, UdevDevice(device)))
 }
 
 /// Quick check: does this DRM device have any connector in Connected state?

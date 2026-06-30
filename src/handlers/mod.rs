@@ -1088,7 +1088,9 @@ impl GammaControlHandler for DriftWm {
     }
 
     fn get_gamma_size(&mut self, output: &smithay::output::Output) -> Option<u32> {
-        self.udev_device.as_ref()?.get_gamma_size(output)
+        self.udev_devices
+            .values()
+            .find_map(|d| d.get_gamma_size(output))
     }
 
     fn set_gamma(
@@ -1096,7 +1098,9 @@ impl GammaControlHandler for DriftWm {
         output: &smithay::output::Output,
         ramp: Option<Vec<u16>>,
     ) -> Option<()> {
-        self.udev_device.as_ref()?.set_gamma(output, ramp)
+        self.udev_devices
+            .values()
+            .find_map(|d| d.set_gamma(output, ramp.clone()))
     }
 }
 

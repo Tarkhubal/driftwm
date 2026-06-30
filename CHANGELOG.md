@@ -2,10 +2,8 @@
 
 ## Unreleased
 
-- Introduced a multi-GPU renderer manager on the udev backend: `Backend::Udev`
-  now holds a `GpuManager` (one GLES renderer per DRM render node) plus the
-  primary render node, and the render loop drives the primary output through
-  `gpu_manager.single_renderer(node)` (a `MultiRenderer`). One-off renderer work
-  (shader compilation, dmabuf import, off-screen screenshot) goes through a new
-  `Backend::with_renderer` accessor. No behaviour change for a single-GPU setup;
-  this is the groundwork for scanning out to displays on a secondary GPU.
+- Reworked the udev backend to hold its DRM devices in a map keyed by KMS node
+  (`DriftWm::udev_devices`) instead of a single `udev_device` handle, and made
+  the render loop iterate the devices. Only the primary GPU is populated today;
+  this is the structural prerequisite for adding a secondary GPU's device on
+  hotplug. No behaviour change for a single-GPU setup.
